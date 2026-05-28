@@ -127,6 +127,21 @@ class RedTeamNetworkEnv(gym.Env):
     def _neighbors(self, node: int) -> list[int]:
         return [v for v in range(self.n) if self.adj[node, v] == 1.0]
 
+    def action_masks(self) -> np.ndarray:
+        """Boolean mask of legal moves for MaskablePPO: adjacent neighbors that
+        are not firewalled (staying put is masked out as wasteful). If the agent
+        is completely walled in, we allow it to stay so there is always >=1 legal
+        action -- the episode then runs down the clock to a 'contained' outcome."""
+        mask = np.zeros(self.n, dtype=bool)
+        for v in range(self.n):
+            if v == self.current:
+                continue
+            if self.adj[self.current, v] == 1.0 and self.node_states[v] != FIREWALL:
+                mask[v] = True
+        if not mask.any():
+            mask[self.current] = True
+        return mask
+
     def _obs(self) -> dict:
         return {
             "node_states": self.node_states.copy(),

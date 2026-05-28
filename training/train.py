@@ -1,15 +1,21 @@
 """
-Train / resume the Red Team PPO agent and export a browser-deployable ONNX policy.
+Train / resume the Red Team agent and export a browser-deployable ONNX policy.
+
+Algorithm: MaskablePPO (sb3-contrib). The action space is Discrete(N) but only a
+handful of nodes are legal moves at any step (adjacent, non-firewalled). Action
+masking removes the illegal actions from the policy distribution during training,
+so the agent stops wasting capacity on ~20 invalid actions per step -- this is the
+key to it actually learning on dense topologies. The exported ONNX model still
+outputs raw [batch, N] logits; the frontend already masks illegal moves before
+argmax, so the inference contract is unchanged.
 
 Behaviour:
-  * If training/latest_model.zip exists  -> load and CONTINUE training.
-  * Otherwise                            -> initialize a fresh PPO model.
-  * Training is bounded by wall-clock time (default 5.5h) via a callback so it
-    always finishes well inside GitHub's 6h runner limit, regardless of CPU speed.
-    Checkpoints are written periodically, so a killed run never loses progress.
-  * On exit it overwrites training/latest_model.zip and exports
-    public/red_team_agent.onnx (raw action logits, so the frontend can mask
-    illegal moves before choosing the agent's next node).
+  * If training/latest_model.zip exists AND is compatible -> load and CONTINUE.
+  * Otherwise (missing or incompatible, e.g. switching algorithms) -> fresh start.
+  * Each env is wrapped in Monitor, so rollout/ep_rew_mean (average score) and
+    rollout/ep_len_mean (average steps per episode) show up in the logs.
+  * Training is wall-clock bounded (default 5.5h) with periodic checkpoints, so it
+    finishes inside GitHub's 6h runner limit and never loses progress.
 
 Run from the repository root:  python training/train.py
 """
@@ -22,11 +28,14 @@ import time
 import numpy as np
 import torch as th
 
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 
-from env import RedTeamNetworkEnv, OPEN  # noqa: F401  (run with cwd=training or via sys.path)
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+
+from env import RedTeamNetworkEnv
 
 # --------------------------------------------------------------------- config
 N_NODES = 24                      # MUST match lib/constants.ts NODE_COUNT on the frontend
@@ -35,14 +44,26 @@ MAX_SECONDS = float(os.environ.get("TRAIN_MAX_SECONDS", 5.5 * 3600))  # 5.5 hour
 CHECKPOINT_EVERY = 50_000         # timesteps between safety saves
 TOTAL_TIMESTEPS = 50_000_000      # an upper bound; the time callback stops us first
 
+# Larger network to handle the high-dimensional graph observation (node states +
+# the full N*N adjacency matrix). Masking matters more than raw size, but a roomy
+# net helps the value function fit the returns.
+NET_ARCH = dict(pi=[512, 512, 256], vf=[512, 512, 256])
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 MODEL_ZIP = os.path.join(HERE, "latest_model.zip")
 ONNX_OUT = os.path.join(REPO, "public", "red_team_agent.onnx")
 
 
+def _mask_fn(env):
+    return env.unwrapped.action_masks()
+
+
 def make_env():
-    return RedTeamNetworkEnv(n_nodes=N_NODES)
+    env = RedTeamNetworkEnv(n_nodes=N_NODES)
+    env = Monitor(env)                 # -> rollout/ep_rew_mean + ep_len_mean
+    env = ActionMasker(env, _mask_fn)  # -> legal-move masking for MaskablePPO
+    return env
 
 
 class TimeAndCheckpointCallback(BaseCallback):
@@ -73,7 +94,9 @@ class TimeAndCheckpointCallback(BaseCallback):
 
 class OnnxableSB3Policy(th.nn.Module):
     """Wraps the SB3 policy so ONNX receives the four named Dict tensors and
-    returns the raw action logits (shape [batch, N])."""
+    returns the raw action logits (shape [batch, N]). Computed straight through
+    the feature extractor + actor head so it works for the maskable policy and
+    never applies masks (the frontend masks at inference)."""
 
     def __init__(self, policy):
         super().__init__()
@@ -86,11 +109,12 @@ class OnnxableSB3Policy(th.nn.Module):
             "target_node": target_node,
             "current_position": current_position,
         }
-        distribution = self.policy.get_distribution(obs)
-        return distribution.distribution.logits  # [B, N]
+        features = self.policy.extract_features(obs)
+        latent_pi, _ = self.policy.mlp_extractor(features)
+        return self.policy.action_net(latent_pi)  # [B, N] raw logits
 
 
-def export_onnx(model: PPO) -> None:
+def export_onnx(model) -> None:
     os.makedirs(os.path.dirname(ONNX_OUT), exist_ok=True)
     model.policy.set_training_mode(False)
     onnxable = OnnxableSB3Policy(model.policy).eval()
@@ -119,31 +143,40 @@ def export_onnx(model: PPO) -> None:
     print(f"[export] wrote {ONNX_OUT}", flush=True)
 
 
+def build_fresh(venv):
+    print("[init] creating fresh MaskablePPO model", flush=True)
+    return MaskablePPO(
+        "MultiInputPolicy",
+        venv,
+        n_steps=1024,
+        batch_size=1024,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.01,
+        learning_rate=3e-4,
+        policy_kwargs=dict(net_arch=NET_ARCH),
+        verbose=1,
+        device="cpu",
+    )
+
+
 def main():
     th.manual_seed(0)
     np.random.seed(0)
 
     venv = DummyVecEnv([make_env for _ in range(N_ENVS)])
 
+    model = None
     if os.path.exists(MODEL_ZIP):
-        print(f"[resume] loading {MODEL_ZIP}", flush=True)
-        model = PPO.load(MODEL_ZIP, env=venv, device="cpu")
-    else:
-        print("[init] creating fresh PPO model", flush=True)
-        model = PPO(
-            "MultiInputPolicy",
-            venv,
-            n_steps=1024,
-            batch_size=1024,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            ent_coef=0.01,
-            learning_rate=3e-4,
-            policy_kwargs=dict(net_arch=[512, 512, 256]),
-            verbose=1,
-            device="cpu",
-        )
+        try:
+            print(f"[resume] loading {MODEL_ZIP}", flush=True)
+            model = MaskablePPO.load(MODEL_ZIP, env=venv, device="cpu")
+        except Exception as exc:  # incompatible checkpoint (old algo / net) -> fresh
+            print(f"[resume-failed] {exc}\n[resume-failed] starting fresh instead", flush=True)
+            model = None
+    if model is None:
+        model = build_fresh(venv)
 
     callback = TimeAndCheckpointCallback(MAX_SECONDS, CHECKPOINT_EVERY, MODEL_ZIP)
     model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback, reset_num_timesteps=False)
