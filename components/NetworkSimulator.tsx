@@ -588,6 +588,8 @@ export default function NetworkSimulator() {
     }
   };
 
+  // ----------------------------------------------------------- defenses
+  const currentToolDef = TOOL_DEFS.find((t) => t.id === tool)!;
   const CREDIT_CAP = cfg.creditCap;
 
   // Which node-state each node tool produces.
