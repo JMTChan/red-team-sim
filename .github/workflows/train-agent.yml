@@ -1,1 +1,61 @@
+name: Train Red Team Agent
 
+# Continuous training loop on a 6-hour cycle:
+#   train ~5.5h  ->  ~30-min idle gap  ->  next run starts automatically.
+# cron "0 */6 * * *" fires at 00:00, 06:00, 12:00, 18:00 UTC = 4 runs/day.
+# Each run resumes from the model the previous run committed, so the agent
+# keeps improving around the clock. (24h only fits four 5.5h sessions; five
+# would need 27.5h, so 4/day is the practical ceiling at this run length.)
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+  workflow_dispatch: {}     # manual "Run workflow" button
+
+# Required so the job can push the new model back to the repo.
+permissions:
+  contents: write
+
+# Never let two training runs race on the same branch.
+concurrency:
+  group: train-agent
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    # Hard ceiling below GitHub's 6h limit. The script itself stops at 5.5h.
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main   # always resume from the latest committed model, not the triggering SHA
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r training/requirements.txt
+
+      - name: Train (resume from latest_model.zip if present)
+        env:
+          TRAIN_MAX_SECONDS: "19800"   # 5.5 hours
+        run: python training/train.py
+
+      - name: Commit & push updated model
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add training/latest_model.zip public/red_team_agent.onnx
+          if git diff --staged --quiet; then
+            echo "No model changes to commit."
+          else
+            git commit -m "chore: auto-trained model $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
