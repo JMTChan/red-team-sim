@@ -1,0 +1,14 @@
+name = "red-team-leaderboard"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# Created with: wrangler kv namespace create SCORES
+# Paste the returned id below.
+[[kv_namespaces]]
+binding = "SCORES"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+
+# Optional: restrict who can read/post to your site only. Until you set this,
+# the board accepts requests from any origin (fine to start, easy to abuse).
+# [vars]
+# ALLOW_ORIGIN = "https://YOUR_GITHUB_USERNAME.github.io"

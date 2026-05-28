@@ -1,0 +1,8 @@
+# Pinned for reproducible CI training. Bump together if you upgrade.
+gymnasium==0.29.1
+stable-baselines3==2.3.2
+torch==2.3.1
+numpy==1.26.4
+onnx==1.16.2
+# onnxruntime is only needed if you run scripts/verify_onnx.py locally.
+onnxruntime==1.18.1
