@@ -58,7 +58,7 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): Networ
     const ring = Math.floor(i / perRing);
     const idxInRing = i % perRing;
     const countInRing = Math.min(perRing, n - ring * perRing);
-    const radius = 0.14 + (rings === 1 ? 0 : (ring / (rings - 1)) * 0.34);
+    const radius = 0.14 + (ring / (rings - 1)) * 0.34;
     const ringOffset = ring * 0.5; // stagger rings so nodes don't line up radially
     const angle = (idxInRing / countInRing) * Math.PI * 2 + ringOffset + (rand() - 0.5) * 0.25;
     positions.push({
