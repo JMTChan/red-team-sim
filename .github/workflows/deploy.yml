@@ -1,11 +1,19 @@
 name: Deploy to GitHub Pages
 
-# Builds the static export and publishes it whenever main changes
-# (including the daily model commits from train-agent.yml).
+# Builds the static export and publishes it on:
+#   * any push to main (your own commits)
+#   * the manual "Run workflow" button
+#   * completion of the training workflow -- this is what actually republishes
+#     the daily auto-trained model. (A normal push from train-agent.yml can't
+#     trigger a deploy because commits made with the default GITHUB_TOKEN don't
+#     start other workflows; workflow_run is not subject to that restriction.)
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
+  workflow_run:
+    workflows: ["Train Red Team Agent"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -19,6 +27,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # When triggered by training, only deploy if that run actually succeeded.
+    # Pushes and manual runs always build.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
