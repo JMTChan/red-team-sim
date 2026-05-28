@@ -1,7 +1,7 @@
 // Global leaderboard endpoint (Cloudflare Worker URL).
 //
 // Paste your deployed Worker URL here, e.g.
-//   export const LEADERBOARD_URL = "https://red-team-leaderboard.you.workers.dev";
+export const LEADERBOARD_URL = "https://red-team-leaderboard.funtee123.workers.dev/";
 // Leave empty for LOCAL-ONLY mode (per-browser high scores still work).
 export const LEADERBOARD_URL = "";
 
