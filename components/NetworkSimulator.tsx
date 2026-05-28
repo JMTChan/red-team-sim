@@ -193,6 +193,12 @@ export default function NetworkSimulator() {
   const cfgRef = useRef(cfg);
   useEffect(() => void (cfgRef.current = cfg), [cfg]);
 
+  // Pan/zoom of the network map.
+  const [view, setView] = useState({ s: 1, tx: 0, ty: 0 });
+  const svgRef = useRef<SVGSVGElement>(null);
+  const panning = useRef(false);
+  const panStart = useRef({ x: 0, y: 0, tx: 0, ty: 0 });
+
   // Refs so the async game loop always reads live values (no stale closures).
   const netRef = useRef(net);
   // Pristine snapshot of the current network (full links, no defenses) so Reset
@@ -710,6 +716,57 @@ export default function NetworkSimulator() {
     deployOnNode(id);
   };
 
+  // ----------------------------------------------------------- pan / zoom
+  const SCALE_MIN = 0.6;
+  const SCALE_MAX = 5;
+
+  const zoomAt = (factor: number, fx: number, fy: number) => {
+    setView((v) => {
+      const s = Math.min(SCALE_MAX, Math.max(SCALE_MIN, v.s * factor));
+      const ratio = s / v.s;
+      return { s, tx: fx - (fx - v.tx) * ratio, ty: fy - (fy - v.ty) * ratio };
+    });
+  };
+  const zoomButton = (factor: number) => zoomAt(factor, VIEW_W / 2, VIEW_H / 2);
+  const resetView = () => setView({ s: 1, tx: 0, ty: 0 });
+
+  const startPan = (e: React.PointerEvent) => {
+    panning.current = true;
+    panStart.current = { x: e.clientX, y: e.clientY, tx: view.tx, ty: view.ty };
+  };
+  const onPanMove = (e: React.PointerEvent) => {
+    if (!panning.current) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const dx = ((e.clientX - panStart.current.x) / rect.width) * VIEW_W;
+    const dy = ((e.clientY - panStart.current.y) / rect.height) * VIEW_H;
+    setView((v) => ({ ...v, tx: panStart.current.tx + dx, ty: panStart.current.ty + dy }));
+  };
+  const endPan = () => {
+    panning.current = false;
+  };
+
+  // Mouse-wheel zoom toward the cursor (native non-passive listener so we can
+  // preventDefault the page scroll while hovering the map).
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const fx = ((e.clientX - rect.left) / rect.width) * VIEW_W;
+      const fy = ((e.clientY - rect.top) / rect.height) * VIEW_H;
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      setView((v) => {
+        const s = Math.min(SCALE_MAX, Math.max(SCALE_MIN, v.s * factor));
+        const ratio = s / v.s;
+        return { s, tx: fx - (fx - v.tx) * ratio, ty: fy - (fy - v.ty) * ratio };
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   // --------------------------------------------------------------- edges
   const edges = useMemo(() => {
     const out: { a: number; b: number }[] = [];
@@ -766,7 +823,26 @@ export default function NetworkSimulator() {
             </span>
           </div>
 
-          <svg viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} className="block w-full">
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+            className="block w-full select-none"
+            style={{ touchAction: "none" }}
+            onPointerMove={onPanMove}
+            onPointerUp={endPan}
+            onPointerLeave={endPan}
+          >
+            {/* drag-anywhere-empty to pan; sits behind the graph so node clicks still work */}
+            <rect
+              x={0}
+              y={0}
+              width={VIEW_W}
+              height={VIEW_H}
+              fill="transparent"
+              className="cursor-grab active:cursor-grabbing"
+              onPointerDown={startPan}
+            />
+            <g transform={`translate(${view.tx} ${view.ty}) scale(${view.s})`}>
             {/* edges */}
             {edges.map(({ a, b }, i) => {
               const pa = net.positions[a];
@@ -877,7 +953,33 @@ export default function NetworkSimulator() {
               </circle>
               <circle r={AGENT_R} fill="none" stroke="#fda4af" strokeWidth={1.5} />
             </g>
+            </g>
           </svg>
+
+          {/* zoom controls */}
+          <div className="absolute bottom-3 right-3 flex flex-col gap-1">
+            <button
+              onClick={() => zoomButton(1.25)}
+              title="Zoom in"
+              className="h-8 w-8 rounded border border-edge bg-void/80 text-lg leading-none text-slate-300 backdrop-blur hover:border-cyan hover:text-cyan"
+            >
+              +
+            </button>
+            <button
+              onClick={() => zoomButton(0.8)}
+              title="Zoom out"
+              className="h-8 w-8 rounded border border-edge bg-void/80 text-lg leading-none text-slate-300 backdrop-blur hover:border-cyan hover:text-cyan"
+            >
+              −
+            </button>
+            <button
+              onClick={resetView}
+              title="Reset view"
+              className="h-8 w-8 rounded border border-edge bg-void/80 text-xs leading-none text-slate-300 backdrop-blur hover:border-cyan hover:text-cyan"
+            >
+              ⤢
+            </button>
+          </div>
         </section>
 
         {/* Control panel */}
