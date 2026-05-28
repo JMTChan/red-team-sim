@@ -49,22 +49,28 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): Networ
     }
   }
 
-  // Layout: concentric rings sized to the node count, with nodes spread evenly
-  // around each ring plus light jitter for an organic "network map" look.
+  // Layout: scatter nodes across the WHOLE canvas using a lightly-jittered grid
+  // (landscape-biased), so the graph fills the rectangle — corners included —
+  // instead of clustering in a centered blob. Each node lands in its own cell
+  // with random jitter, keeping spacing even but organic.
   const positions: NodePos[] = [];
-  const rings = n <= 9 ? 2 : n <= 20 ? 3 : 4;
-  const perRing = Math.ceil(n / rings);
+  const cols = Math.max(1, Math.round(Math.sqrt(n * 1.4)));
+  const rows = Math.ceil(n / cols);
+  const cells = Array.from({ length: cols * rows }, (_, k) => k);
+  for (let k = cells.length - 1; k > 0; k--) {
+    const j = Math.floor(rand() * (k + 1));
+    [cells[k], cells[j]] = [cells[j], cells[k]];
+  }
   for (let i = 0; i < n; i++) {
-    const ring = Math.floor(i / perRing);
-    const idxInRing = i % perRing;
-    const countInRing = Math.min(perRing, n - ring * perRing);
-    const radius = 0.14 + (ring / (rings - 1)) * 0.34;
-    const ringOffset = ring * 0.5; // stagger rings so nodes don't line up radially
-    const angle = (idxInRing / countInRing) * Math.PI * 2 + ringOffset + (rand() - 0.5) * 0.25;
+    const cell = cells[i];
+    const cx = cell % cols;
+    const cy = Math.floor(cell / cols);
+    const x = (cx + 0.5) / cols + (rand() - 0.5) * (0.62 / cols);
+    const y = (cy + 0.5) / rows + (rand() - 0.5) * (0.62 / rows);
     positions.push({
       id: i,
-      x: 0.5 + Math.cos(angle) * radius + (rand() - 0.5) * 0.04,
-      y: 0.5 + Math.sin(angle) * radius + (rand() - 0.5) * 0.04,
+      x: Math.min(0.97, Math.max(0.03, x)),
+      y: Math.min(0.97, Math.max(0.03, y)),
     });
   }
 
