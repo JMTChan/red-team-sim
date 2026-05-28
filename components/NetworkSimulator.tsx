@@ -147,7 +147,7 @@ function roundScore(
 
 // Layout mapping (normalized 0..1 -> SVG viewBox).
 const VIEW_W = 1000;
-const VIEW_H = 640;
+const VIEW_H = 760;
 const PAD = 60;
 const px = (x: number) => PAD + x * (VIEW_W - 2 * PAD);
 const py = (y: number) => PAD + y * (VIEW_H - 2 * PAD);
@@ -811,7 +811,7 @@ export default function NetworkSimulator() {
         </div>
       </header>
 
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_320px]">
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_320px] lg:items-start">
         {/* Graph panel */}
         <section className="relative overflow-hidden rounded-lg border border-edge bg-panel shadow-glow">
           <div className="flex items-center justify-between border-b border-edge px-4 py-2 text-xs">
