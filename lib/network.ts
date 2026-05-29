@@ -11,6 +11,7 @@ export interface NetworkState {
   positions: NodePos[];
   nodeStates: NodeState[];
   start: number;
+  foothold: number; // first objective the agent must reach (multi-stage attack)
   target: number;
 }
 
@@ -77,6 +78,9 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): Networ
   let start = Math.floor(rand() * n);
   let target = Math.floor(rand() * n);
   while (target === start) target = Math.floor(rand() * n);
+  // Multi-stage objective: the agent must reach a foothold before the database.
+  let foothold = Math.floor(rand() * n);
+  while (foothold === start || foothold === target) foothold = Math.floor(rand() * n);
 
   // Give the entry and the database enough connections that they can't be born in
   // a corner (and so a player can't cheaply wall/sever them off in one or two
@@ -97,10 +101,11 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): Networ
   };
   boostDegree(start);
   boostDegree(target);
+  boostDegree(foothold);
 
   const nodeStates: NodeState[] = Array(n).fill(OPEN) as NodeState[];
 
-  return { adjacency, positions, nodeStates, start, target };
+  return { adjacency, positions, nodeStates, start, foothold, target };
 }
 
 /** Hop distance over passable nodes (firewalls block). Returns Infinity if unreachable. */
@@ -140,15 +145,16 @@ export function neighbors(adjacency: number[][], node: number): number[] {
   return out;
 }
 
-/** Build the four observation tensors in the exact shape/order the ONNX model expects. */
-export function buildObservation(net: NetworkState, current: number) {
+/** Build the four observation tensors in the exact shape/order the ONNX model expects.
+ *  `goal` is the agent's CURRENT objective (foothold first, then the database). */
+export function buildObservation(net: NetworkState, current: number, goal: number = net.target) {
   const n = NODE_COUNT;
   const node_states = Float32Array.from(net.nodeStates);
   const adjacency_matrix = new Float32Array(n * n);
   for (let i = 0; i < n; i++)
     for (let j = 0; j < n; j++) adjacency_matrix[i * n + j] = net.adjacency[i][j];
   const target_node = new Float32Array(n);
-  target_node[net.target] = 1;
+  target_node[goal] = 1;
   const current_position = new Float32Array(n);
   current_position[current] = 1;
   return { node_states, adjacency_matrix, target_node, current_position };
