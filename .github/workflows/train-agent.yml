@@ -7,8 +7,8 @@ name: Train Red Team Agent
 # keeps improving around the clock. (24h only fits four 5.5h sessions; five
 # would need 27.5h, so 4/day is the practical ceiling at this run length.)
 on:
-  schedule:
-    - cron: "0 */6 * * *"  # every 6 hours
+  # schedule:
+  #   - cron: "0 */6 * * *"  # every 6 hours (disabled for now — manual runs only)
   workflow_dispatch: {}     # manual "Run workflow" button
 
 # Required so the job can push the new model back to the repo.
