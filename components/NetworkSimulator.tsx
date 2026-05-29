@@ -17,6 +17,8 @@ import {
   bfsDistance,
   neighbors,
   buildObservation,
+  linkReachable,
+  twoDisjointPaths,
   type NetworkState,
 } from "@/lib/network";
 import {
@@ -177,7 +179,7 @@ export default function NetworkSimulator() {
   const [difficulty, setDifficulty] = useState<Difficulty>(DEFAULT_DIFFICULTY);
   const initialCfg = DIFFICULTY[DEFAULT_DIFFICULTY];
   const [net, setNet] = useState<NetworkState>(() =>
-    generateNetwork(Date.now(), initialCfg.extraEdgeProb),
+    generateNetwork(Date.now(), initialCfg.extraEdgeProb, DEFAULT_DIFFICULTY !== "recruit"),
   );
   const [agentPos, setAgentPos] = useState<number>(() => net.start);
   const [status, setStatus] = useState<Status>("idle");
@@ -429,7 +431,7 @@ export default function NetworkSimulator() {
     (nextWave: number) => {
       const base = cfgRef.current;
       const edgeProb = Math.min(0.5, base.extraEdgeProb + (nextWave - 1) * 0.03);
-      const fresh = generateNetwork(Date.now(), edgeProb);
+      const fresh = generateNetwork(Date.now(), edgeProb, diffRef.current !== "recruit");
       setNet(fresh);
       netRef.current = fresh;
       baselineRef.current = {
@@ -794,7 +796,7 @@ export default function NetworkSimulator() {
   };
 
   const newNetwork = () => {
-    const fresh = generateNetwork(Date.now(), cfg.extraEdgeProb);
+    const fresh = generateNetwork(Date.now(), cfg.extraEdgeProb, difficulty !== "recruit");
     setNet(fresh);
     netRef.current = fresh;
     baselineRef.current = {
@@ -824,7 +826,7 @@ export default function NetworkSimulator() {
     setBoardDiff(d);
     cfgRef.current = c;
     setTickMs(c.tickMs);
-    const fresh = generateNetwork(Date.now(), c.extraEdgeProb);
+    const fresh = generateNetwork(Date.now(), c.extraEdgeProb, d !== "recruit");
     setNet(fresh);
     netRef.current = fresh;
     baselineRef.current = {
@@ -913,16 +915,17 @@ export default function NetworkSimulator() {
     });
   };
 
-  // The core invariant: a passable route from the agent's current position to the
-  // database must always exist. This blocks the "instant enclosure" exploits —
-  // walling the entry so the agent can't move, or sealing the target so it can
-  // never be reached. Defenses can reshape and lengthen the path, never erase it.
-  // (Only firewalls and severed links reduce reachability; honeypots/corrupts are
-  // passable, so they never need this check.)
-  const routeSurvives = (adjacency: number[][], nodeStates: NodeState[]): boolean => {
-    const from = posRef.current;
-    const to = netRef.current.target;
-    return Number.isFinite(bfsDistance(adjacency, nodeStates, from, to));
+  // A complete route start -> foothold -> database must always survive a sever. On
+  // Operator/Elite each leg must survive as TWO node-disjoint paths, so severing can
+  // never funnel the agent through a single chokepoint; Recruit stays lenient (one
+  // path) as the beginner mode. Firewalls are penetrable, so node states don't affect
+  // reachability — only severed links do, which is why this checks adjacency alone.
+  const routeSurvives = (adjacency: number[][]): boolean => {
+    const n = netRef.current;
+    const strict = diffRef.current !== "recruit";
+    const legOk = (a: number, b: number) =>
+      strict ? twoDisjointPaths(adjacency, a, b) : linkReachable(adjacency, a, b);
+    return legOk(n.start, n.foothold) && legOk(n.foothold, n.target);
   };
 
   const deployOnNode = (id: number) => {
@@ -981,15 +984,8 @@ export default function NetworkSimulator() {
       pushLog("xx insufficient credits.");
       return;
     }
-    // A firewall removes a node from play — make sure a route to the DB survives.
-    if (targetState === FIREWALL) {
-      const probe = [...netRef.current.nodeStates];
-      probe[id] = FIREWALL as NodeState;
-      if (!routeSurvives(netRef.current.adjacency, probe)) {
-        pushLog("xx firewall blocked — that would seal the agent off from the database.");
-        return;
-      }
-    }
+    // Firewalls are penetrable now, so placing one never seals the agent off — no
+    // reachability check needed. (Only Sever can change connectivity; see severLink.)
     setNodeState(id, targetState);
     setCredits((c) => Math.min(CREDIT_CAP, c - netCost));
     sfx("place");
@@ -1001,11 +997,15 @@ export default function NetworkSimulator() {
       pushLog("xx insufficient credits.");
       return;
     }
-    // Don't allow severing the agent's last route to the database.
+    // Don't allow severing that funnels the agent through a single chokepoint.
     const probe = netRef.current.adjacency.map((row) => [...row]);
     probe[a][b] = probe[b][a] = 0;
-    if (!routeSurvives(probe, netRef.current.nodeStates)) {
-      pushLog("xx cannot sever — that would cut the agent off from the database entirely.");
+    if (!routeSurvives(probe)) {
+      pushLog(
+        diffRef.current === "recruit"
+          ? "xx cannot sever — that would cut the agent off from an objective."
+          : "xx cannot sever — the agent must keep two separate routes (no single chokepoint).",
+      );
       return;
     }
     setNet((n) => {
