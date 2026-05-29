@@ -26,7 +26,7 @@ function mulberry32(seed: number) {
 }
 
 /** Random connected undirected graph: spanning tree + extra edges. */
-export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): NetworkState {
+export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18, ensureTwoPaths = false): NetworkState {
   const rand = mulberry32(seed);
   const n = NODE_COUNT;
   const adjacency: number[][] = Array.from({ length: n }, () => Array(n).fill(0));
@@ -103,6 +103,56 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18): Networ
   boostDegree(target);
   boostDegree(foothold);
 
+  // On harder difficulties, guarantee two node-disjoint routes along each leg of the
+  // attack (start->foothold, foothold->database) so there's no single natural
+  // chokepoint — and so the sever rule that preserves this is actually satisfiable.
+  if (ensureTwoPaths) {
+    const reachSet = (src: number, removed: number): boolean[] => {
+      const vis = new Array(n).fill(false);
+      vis[src] = true;
+      const q = [src];
+      while (q.length) {
+        const u = q.shift() as number;
+        for (let w = 0; w < n; w++) {
+          if (adjacency[u][w] === 1 && w !== removed && !vis[w]) {
+            vis[w] = true;
+            q.push(w);
+          }
+        }
+      }
+      return vis;
+    };
+    const ensure2 = (a: number, b: number) => {
+      let guard = 0;
+      while (guard++ < n) {
+        let cut = -1;
+        for (let v = 0; v < n; v++) {
+          if (v === a || v === b) continue;
+          if (!linkReachable(adjacency, a, b, v)) {
+            cut = v;
+            break;
+          }
+        }
+        if (cut === -1) break; // already 2-connected on this leg
+        // Bridge the two sides around the cut with one new edge (avoid the trivial
+        // a-b direct link so the leg keeps some length).
+        const side = reachSet(a, cut);
+        const aSide: number[] = [];
+        const bSide: number[] = [];
+        for (let v = 0; v < n; v++) {
+          if (v === cut) continue;
+          (side[v] ? aSide : bSide).push(v);
+        }
+        const uA = aSide.find((x) => x !== a) ?? a;
+        const uB = bSide.find((x) => x !== b) ?? bSide[0] ?? b;
+        if (uA === uB) break;
+        adjacency[uA][uB] = adjacency[uB][uA] = 1;
+      }
+    };
+    ensure2(start, foothold);
+    ensure2(foothold, target);
+  }
+
   const nodeStates: NodeState[] = Array(n).fill(OPEN) as NodeState[];
 
   return { adjacency, positions, nodeStates, start, foothold, target };
@@ -143,6 +193,48 @@ export function neighbors(adjacency: number[][], node: number): number[] {
   const out: number[] = [];
   for (let v = 0; v < adjacency.length; v++) if (adjacency[node][v] === 1) out.push(v);
   return out;
+}
+
+/** Can `from` reach `to` over links only, optionally with one node removed?
+ *  Node states never block here — firewalls are penetrable, everything else is
+ *  passable — so reachability depends purely on severed links. */
+export function linkReachable(
+  adjacency: number[][],
+  from: number,
+  to: number,
+  removed = -1,
+): boolean {
+  if (from === to) return true;
+  const n = adjacency.length;
+  const visited = new Array(n).fill(false);
+  visited[from] = true;
+  if (removed >= 0 && removed !== from && removed !== to) visited[removed] = true;
+  const queue = [from];
+  while (queue.length) {
+    const u = queue.shift() as number;
+    for (let v = 0; v < n; v++) {
+      if (adjacency[u][v] === 1 && !visited[v]) {
+        if (v === to) return true;
+        visited[v] = true;
+        queue.push(v);
+      }
+    }
+  }
+  return false;
+}
+
+/** True if there are >=2 node-disjoint paths between `from` and `to` — i.e. no
+ *  single intermediate node whose removal disconnects them (Menger). Used to stop
+ *  the defender funnelling the agent through one chokepoint. */
+export function twoDisjointPaths(adjacency: number[][], from: number, to: number): boolean {
+  if (from === to) return true;
+  if (!linkReachable(adjacency, from, to)) return false;
+  const n = adjacency.length;
+  for (let v = 0; v < n; v++) {
+    if (v === from || v === to) continue;
+    if (!linkReachable(adjacency, from, to, v)) return false;
+  }
+  return true;
 }
 
 /** Build the four observation tensors in the exact shape/order the ONNX model expects.
