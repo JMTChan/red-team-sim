@@ -18,6 +18,20 @@ import { NODE_COUNT } from "../lib/constants";
 // basePath. Keep the version aligned with package.json's onnxruntime-web.
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 
+// The policy was TRAINED stochastically (PPO samples its moves), so we run it the
+// same way at inference: sample the next move from its own distribution instead of
+// always taking the single best one. Pure argmax is deterministic and a memoryless
+// policy will fall into limit cycles (A->B->A, or longer A->B->C->A circles) on
+// some boards; sampling breaks cycles of any length while still favoring the
+// target, because the distribution itself points that way.
+//   TEMPERATURE: 1.0 reproduces training behavior. Lower = sharper/more optimal
+//                (but too low reintroduces deterministic loops); higher = more
+//                exploratory/wandering.
+//   BACKTRACK_PENALTY: extra soft discouragement against immediately reversing
+//                into the node we just came from (1 = none, 0 = forbidden).
+const TEMPERATURE = 1.0;
+const BACKTRACK_PENALTY = 0.3;
+
 let session: ort.InferenceSession | null = null;
 // Node the agent occupied on the previous inference, so we can discourage it from
 // immediately bouncing straight back (the classic A->B->A->B loop a memoryless,
@@ -59,41 +73,46 @@ function chooseAction(
   validActions: number[],
   avoid: number,
 ): { action: number; dist: number[] } {
-  // Greedy legal move.
-  let best = -1;
-  let bestVal = -Infinity;
-  for (const a of validActions) {
-    if (logits[a] > bestVal) {
-      bestVal = logits[a];
-      best = a;
-    }
-  }
-  // Softmax over the legal logits -> a "where does it want to go" distribution
-  // (kept as the true policy intent, so the heatmap reflects what it learned).
-  const dist = new Array(NODE_COUNT).fill(0);
-  let sum = 0;
-  for (const a of validActions) {
-    const e = Math.exp(logits[a] - bestVal);
-    dist[a] = e;
-    sum += e;
-  }
-  if (sum > 0) for (const a of validActions) dist[a] /= sum;
+  // Max legal logit, for numerically-stable softmax.
+  let maxL = -Infinity;
+  for (const a of validActions) if (logits[a] > maxL) maxL = logits[a];
 
-  // Anti-backtrack: if the greedy pick is to walk straight back where we came
-  // from, take the next-best legal move instead — unless backtracking is the
-  // ONLY option (a genuine dead end), in which case we allow it.
-  let action = best;
-  if (action === avoid && validActions.length > 1) {
-    let alt = -1;
-    let altVal = -Infinity;
+  // True policy intent (temperature 1) -> used for the heatmap so it reflects
+  // what the model actually learned, independent of how we sample.
+  const dist = new Array(NODE_COUNT).fill(0);
+  let dsum = 0;
+  for (const a of validActions) {
+    const e = Math.exp(logits[a] - maxL);
+    dist[a] = e;
+    dsum += e;
+  }
+  if (dsum > 0) for (const a of validActions) dist[a] /= dsum;
+
+  // Sampling distribution: temperature-scaled, with a soft penalty on walking
+  // straight back where we came from (kept soft so it can still backtrack out of
+  // a genuine dead end).
+  const T = Math.max(0.05, TEMPERATURE);
+  const probs = new Array(NODE_COUNT).fill(0);
+  let psum = 0;
+  for (const a of validActions) {
+    let e = Math.exp((logits[a] - maxL) / T);
+    if (a === avoid && validActions.length > 1) e *= BACKTRACK_PENALTY;
+    probs[a] = e;
+    psum += e;
+  }
+
+  // Sample one legal move from probs.
+  let action = validActions[0];
+  if (psum > 0) {
+    let r = Math.random() * psum;
     for (const a of validActions) {
-      if (a === avoid) continue;
-      if (logits[a] > altVal) {
-        altVal = logits[a];
-        alt = a;
+      r -= probs[a];
+      if (r <= 0) {
+        action = a;
+        break;
       }
+      action = a; // fallthrough guard for float rounding
     }
-    if (alt >= 0) action = alt;
   }
   return { action, dist };
 }
