@@ -1,7 +1,8 @@
 // Red Team Simulator — global leaderboard Worker (Cloudflare Workers + KV).
 //
 // Endpoints (CORS-enabled):
-//   GET  /scores  -> { scores: [{name, score, difficulty, ts}, ...] }  (top 50)
+//   GET  /scores  -> { scores: [...all], boards: { recruit:[], operator:[], elite:[] } }
+//                    (top 50 PER difficulty; `scores` is the three boards concatenated)
 //   POST /scores  -> body { name, result, turns, creditsLeft, difficulty, turnstileToken? }
 //                    The server RECOMPUTES the score from these ingredients and
 //                    bounds-checks every field, so the client can't assert a score.
@@ -17,8 +18,9 @@
 //   RATE_LIMIT         max submits per IP per minute (default 30)
 
 const TOP_KEY = "top";
-const MAX_ENTRIES = 50;
+const MAX_PER_DIFF = 50; // top-N kept PER threat level
 const DEFAULT_RATE_LIMIT = 30; // submits per IP per 60s
+const DIFFS = ["recruit", "operator", "elite"];
 
 // Must mirror DIFFICULTY + DIFF_MULT + roundScore() in components/NetworkSimulator.tsx.
 const DIFF = {
@@ -33,6 +35,42 @@ function scoreFor(result, turns, creditsLeft, cfg) {
   const efficiency = Math.max(0, creditsLeft) * 10;
   const method = result === "honeypot" ? 200 : 0;
   return Math.round((300 + speed + efficiency + method) * cfg.mult);
+}
+
+// Boards are stored per difficulty: { recruit: [...], operator: [...], elite: [...] }.
+// This keeps each threat level its own top-N so high-multiplier Elite scores can't
+// evict Recruit/Operator entries from the table.
+function emptyBoards() {
+  return { recruit: [], operator: [], elite: [] };
+}
+
+function readBoards(raw) {
+  if (!raw) return emptyBoards();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return emptyBoards();
+  }
+  const boards = emptyBoards();
+  if (Array.isArray(parsed)) {
+    // Migrate the old single combined list into per-difficulty buckets.
+    for (const e of parsed) {
+      const d = DIFFS.includes(e.difficulty) ? e.difficulty : "operator";
+      boards[d].push(e);
+    }
+  } else if (parsed && typeof parsed === "object") {
+    for (const d of DIFFS) if (Array.isArray(parsed[d])) boards[d] = parsed[d];
+  }
+  for (const d of DIFFS) {
+    boards[d].sort((a, b) => b.score - a.score);
+    boards[d] = boards[d].slice(0, MAX_PER_DIFF);
+  }
+  return boards;
+}
+
+function flatten(boards) {
+  return [...boards.recruit, ...boards.operator, ...boards.elite];
 }
 
 function corsHeaders(origin) {
@@ -84,8 +122,8 @@ export default {
     if (!url.pathname.endsWith("/scores")) return json({ error: "not found" }, origin, 404);
 
     if (request.method === "GET") {
-      const raw = await env.SCORES.get(TOP_KEY);
-      return json({ scores: raw ? JSON.parse(raw) : [] }, origin);
+      const boards = readBoards(await env.SCORES.get(TOP_KEY));
+      return json({ scores: flatten(boards), boards }, origin);
     }
 
     if (request.method === "POST") {
@@ -131,12 +169,12 @@ export default {
       if (score <= 0) return json({ error: "invalid score" }, origin, 400);
 
       const raw = await env.SCORES.get(TOP_KEY);
-      const scores = raw ? JSON.parse(raw) : [];
-      scores.push({ name, score, difficulty, ts: Date.now() });
-      scores.sort((a, b) => b.score - a.score);
-      const top = scores.slice(0, MAX_ENTRIES);
-      await env.SCORES.put(TOP_KEY, JSON.stringify(top));
-      return json({ scores: top }, origin);
+      const boards = readBoards(raw);
+      boards[difficulty].push({ name, score, difficulty, ts: Date.now() });
+      boards[difficulty].sort((a, b) => b.score - a.score);
+      boards[difficulty] = boards[difficulty].slice(0, MAX_PER_DIFF);
+      await env.SCORES.put(TOP_KEY, JSON.stringify(boards));
+      return json({ scores: flatten(boards), boards }, origin);
     }
 
     return json({ error: "method not allowed" }, origin, 405);
