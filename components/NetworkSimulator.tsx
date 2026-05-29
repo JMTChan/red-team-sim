@@ -29,6 +29,14 @@ import {
   type ScoreSubmission,
 } from "@/lib/leaderboard";
 import { TURNSTILE_SITE_KEY } from "@/lib/config";
+import {
+  ASSETS,
+  DEFENSE_CONCEPTS,
+  KILL_CHAIN,
+  currentPhase,
+  incidentNarrative,
+  type RoundReport,
+} from "@/lib/education";
 
 type Status = "idle" | "running" | "breach" | "trapped" | "stalled" | "detected";
 
@@ -244,6 +252,10 @@ export default function NetworkSimulator() {
   const reachedFootholdRef = useRef(false);
   const [monitors, setMonitors] = useState<Set<number>>(new Set());
   const monitorsRef = useRef<Set<number>>(new Set());
+  // Per-round tally for the incident report, plus the report + field-guide modals.
+  const roundStatsRef = useRef({ fwHold: 0, fwBreach: 0, hpTrap: 0, hpEvade: 0, tarpit: 0, corrupt: 0 });
+  const [report, setReport] = useState<RoundReport | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
   const audioCtx = useRef<AudioContext | null>(null);
   const tickRef = useRef<() => void>(() => {});
 
@@ -410,6 +422,7 @@ export default function NetworkSimulator() {
     setDetection(0);
     reachedFootholdRef.current = false;
     setReachedFoothold(false);
+    roundStatsRef.current = { fwHold: 0, fwBreach: 0, hpTrap: 0, hpEvade: 0, tarpit: 0, corrupt: 0 };
     if (clearMonitors) {
       monitorsRef.current = new Set();
       setMonitors(new Set());
@@ -465,6 +478,16 @@ export default function NetworkSimulator() {
   const concludeRound = useCallback(
     (contained: boolean, result: string) => {
       const base = award(result);
+      const st = roundStatsRef.current;
+      setReport({
+        result,
+        contained,
+        turns: turnsRef.current,
+        creditsLeft: creditsRef.current,
+        detection: Math.round(detectionRef.current * 100),
+        reachedFoothold: reachedFootholdRef.current,
+        ...st,
+      });
       if (contained) {
         sfx(result === "honeypot" ? "honeypot" : "contain");
         setFlash("contain");
@@ -619,15 +642,18 @@ export default function NetworkSimulator() {
       // attempt rebuffs the agent (it stays put, turn still spent) and is noisy.
       if (state === FIREWALL) {
         if (Math.random() >= FIREWALL_BREACH) {
+          roundStatsRef.current.fwHold++;
           detectionRef.current = Math.min(1, detectionRef.current + DETECTION_ON_FAIL);
           setHeat([]);
           pushLog(`!! firewall held at node ${action} — breach failed (detection +).`);
           return;
         }
+        roundStatsRef.current.fwBreach++;
         pushLog(`>> agent forced the firewall at node ${action}.`);
       } else if (state === SLOW) {
         // Tarpit: sometimes the agent bogs down and loses the tick.
         if (Math.random() >= SLOW_PASS) {
+          roundStatsRef.current.tarpit++;
           setHeat([]);
           pushLog(`~~ agent bogged down in the tarpit at node ${action}.`);
           return;
@@ -657,6 +683,7 @@ export default function NetworkSimulator() {
       } else if (state === HONEYPOT) {
         // Leaky honeypot: only sometimes catches the agent; otherwise it slips by.
         if (Math.random() < HONEYPOT_TRAP) {
+          roundStatsRef.current.hpTrap++;
           statusRef.current = "trapped";
           setStatus("trapped");
           setScore((s) => ({ ...s, contained: s.contained + 1 }));
@@ -664,9 +691,11 @@ export default function NetworkSimulator() {
           pushLog(`<< TRAPPED — agent ensnared in honeypot at node ${action}.`);
           concludeRound(true, "honeypot");
         } else {
+          roundStatsRef.current.hpEvade++;
           pushLog(`.. agent slipped past the honeypot at node ${action}.`);
         }
       } else if (state === CORRUPTED) {
+        roundStatsRef.current.corrupt++;
         corruptNext.current = true;
         pushLog(`~~ agent corrupted at node ${action} — next move scrambled.`);
       }
@@ -1152,6 +1181,8 @@ export default function NetworkSimulator() {
     detected: { text: "AGENT DETECTED", color: "#38bdf8" },
   };
 
+  const narr = report ? incidentNarrative(report) : null;
+
   return (
     <div className="font-mono">
       {/* Header */}
@@ -1188,6 +1219,13 @@ export default function NetworkSimulator() {
           >
             ?
           </button>
+          <button
+            onClick={() => setShowGuide(true)}
+            title="Field guide: assets, defenses & attack phases"
+            className="rounded border border-edge px-2 py-1 text-slate-400 hover:border-slate-600"
+          >
+            Guide
+          </button>
           <span
             className={`ml-1 inline-block h-2 w-2 rounded-full ${engine === "model" ? "bg-viper" : "bg-amber"} ${
               engine === "loading" ? "blink" : ""
@@ -1212,7 +1250,7 @@ export default function NetworkSimulator() {
             </span>
             <span className="text-slate-500">
               <span className={reachedFoothold ? "text-viper" : "text-amber"}>
-                {reachedFoothold ? "→ DATABASE" : "→ FOOTHOLD"}
+                {currentPhase(reachedFoothold).label}
               </span>{" "}
               · turn {turns}/{cfg.maxTurns}
             </span>
@@ -1359,6 +1397,16 @@ export default function NetworkSimulator() {
                     fontFamily="var(--font-mono)"
                   >
                     {p.id}
+                  </text>
+                  <text
+                    textAnchor="middle"
+                    dy={NODE_R + 11}
+                    fontSize="7"
+                    fill={ASSETS[net.roles[p.id]].color}
+                    opacity={0.7}
+                    fontFamily="var(--font-mono)"
+                  >
+                    {ASSETS[net.roles[p.id]].code}
                   </text>
                   {isStart && (
                     <text textAnchor="middle" dy={-(NODE_R + 6)} fontSize="9" fill="#64748b">
@@ -1768,6 +1816,112 @@ export default function NetworkSimulator() {
               className="mt-4 w-full rounded border border-cyan bg-cyan/10 py-2 text-xs font-semibold text-cyan hover:bg-cyan/20"
             >
               Got it — let me in
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* incident report (post-round) */}
+      {report && narr && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/80 p-4 backdrop-blur-sm">
+          <div className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg border border-edge bg-panel p-5 shadow-glow">
+            <div className="text-[10px] tracking-widest text-slate-500">// INCIDENT REPORT</div>
+            <h2
+              className="font-display text-lg font-bold tracking-wider"
+              style={{ color: narr.outcome === "breach" ? "#f43f5e" : "#34d399" }}
+            >
+              {narr.headline}
+            </h2>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+              <div className="rounded border border-edge p-2">
+                <div className="text-lg font-bold text-slate-200">{report.turns}</div>
+                <div className="text-[9px] tracking-widest text-slate-500">TURNS</div>
+              </div>
+              <div className="rounded border border-edge p-2">
+                <div className="text-lg font-bold text-slate-200">{report.detection}%</div>
+                <div className="text-[9px] tracking-widest text-slate-500">DETECTION</div>
+              </div>
+              <div className="rounded border border-edge p-2">
+                <div className="text-lg font-bold text-slate-200">{report.creditsLeft}</div>
+                <div className="text-[9px] tracking-widest text-slate-500">CREDITS LEFT</div>
+              </div>
+            </div>
+            <h3 className="mt-4 font-display text-xs tracking-widest text-slate-400">ATTACKER ACTIVITY</h3>
+            <ul className="mt-1 space-y-1 text-[11px] leading-relaxed text-slate-400">
+              {narr.techniques.map((t, i) => (
+                <li key={i}>• {t}</li>
+              ))}
+            </ul>
+            <h3 className="mt-3 font-display text-xs tracking-widest text-slate-400">ANALYST TAKEAWAY</h3>
+            <p className="mt-1 text-[11px] leading-relaxed text-slate-300">{narr.takeaway}</p>
+            <button
+              onClick={() => setReport(null)}
+              className="mt-4 w-full rounded border border-cyan bg-cyan/10 py-2 text-xs font-semibold text-cyan hover:bg-cyan/20"
+            >
+              Close report
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* field guide */}
+      {showGuide && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/80 p-4 backdrop-blur-sm">
+          <div className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-lg border border-edge bg-panel p-5 shadow-glow">
+            <h2 className="font-display text-lg font-bold tracking-wider text-cyan">FIELD GUIDE</h2>
+            <p className="mt-1 text-[11px] text-slate-500">
+              How the board maps onto a real intrusion — assets, attack phases, and what each
+              defense represents.
+            </p>
+
+            <h3 className="mt-4 font-display text-xs tracking-widest text-slate-400">ASSET TYPES</h3>
+            <div className="mt-2 space-y-1.5 text-xs">
+              {(Object.keys(ASSETS) as (keyof typeof ASSETS)[]).map((k) => (
+                <div key={k} className="flex items-start gap-2">
+                  <span className="mt-0.5 w-8 shrink-0 font-bold" style={{ color: ASSETS[k].color }}>
+                    {ASSETS[k].code}
+                  </span>
+                  <span>
+                    <span className="text-slate-300">{ASSETS[k].label}</span>{" "}
+                    <span className="text-slate-500">— {ASSETS[k].blurb}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <h3 className="mt-4 font-display text-xs tracking-widest text-slate-400">
+              ATTACK PHASES · MITRE ATT&amp;CK
+            </h3>
+            <div className="mt-2 space-y-1.5 text-xs">
+              {KILL_CHAIN.map((p) => (
+                <div key={p.tactic} className="flex items-start gap-2">
+                  <span className="mt-0.5 w-14 shrink-0 font-mono text-[10px] text-slate-500">{p.tactic}</span>
+                  <span>
+                    <span className="text-slate-300">{p.label}</span>{" "}
+                    <span className="text-slate-500">— {p.desc}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <h3 className="mt-4 font-display text-xs tracking-widest text-slate-400">
+              DEFENSES &amp; REAL-WORLD TECHNIQUES
+            </h3>
+            <div className="mt-2 space-y-2 text-xs">
+              {DEFENSE_CONCEPTS.map((c) => (
+                <div key={c.tool}>
+                  <div className="font-semibold text-slate-200">{c.title}</div>
+                  <div className="text-slate-500">{c.realWorld}</div>
+                  <div className="text-slate-400">↳ {c.tip}</div>
+                </div>
+              ))}
+            </div>
+
+            <button
+              onClick={() => setShowGuide(false)}
+              className="mt-4 w-full rounded border border-cyan bg-cyan/10 py-2 text-xs font-semibold text-cyan hover:bg-cyan/20"
+            >
+              Close
             </button>
           </div>
         </div>
