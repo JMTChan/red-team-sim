@@ -76,3 +76,16 @@ body {
   background: #1b2330;
   border-radius: 3px;
 }
+
+/* outcome flash overlay (breach/contain juice) */
+@keyframes flash-out {
+  from {
+    opacity: 0.6;
+  }
+  to {
+    opacity: 0;
+  }
+}
+.flash-fx {
+  animation: flash-out 0.48s ease-out forwards;
+}
