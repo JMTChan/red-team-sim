@@ -7,6 +7,7 @@ import {
   FIREWALL,
   HONEYPOT,
   CORRUPTED,
+  SLOW,
   TOOLS,
   type Tool,
   type NodeState,
@@ -27,7 +28,7 @@ import {
 } from "@/lib/leaderboard";
 import { TURNSTILE_SITE_KEY } from "@/lib/config";
 
-type Status = "idle" | "running" | "breach" | "trapped" | "stalled";
+type Status = "idle" | "running" | "breach" | "trapped" | "stalled" | "detected";
 
 interface ToolDef {
   id: Tool;
@@ -38,10 +39,12 @@ interface ToolDef {
 }
 
 const TOOL_DEFS: ToolDef[] = [
-  { id: TOOLS.FIREWALL, label: "Firewall", hint: "Blocks the node entirely", cost: 2, color: "#f59e0b" },
-  { id: TOOLS.HONEYPOT, label: "Honeypot", hint: "Traps & terminates the agent", cost: 3, color: "#a78bfa" },
+  { id: TOOLS.FIREWALL, label: "Firewall", hint: "Agent must breach it (~35% per try) — slows, doesn't block", cost: 2, color: "#f59e0b" },
+  { id: TOOLS.HONEYPOT, label: "Honeypot", hint: "~70% chance to trap the agent — layer them", cost: 3, color: "#a78bfa" },
   { id: TOOLS.CORRUPT, label: "Corrupt", hint: "Randomizes the agent's next move", cost: 2, color: "#22d3ee" },
+  { id: TOOLS.TARPIT, label: "Tarpit", hint: "Slows the agent — ~40% chance to stall each entry", cost: 1, color: "#14b8a6" },
   { id: TOOLS.SEVER, label: "Sever Link", hint: "Cut a connection between nodes", cost: 1, color: "#f43f5e" },
+  { id: TOOLS.MONITOR, label: "Monitor", hint: "Raises detection near it — catch the agent before it breaches", cost: 2, color: "#38bdf8" },
 ];
 
 const STATE_COLOR: Record<number, string> = {
@@ -49,6 +52,7 @@ const STATE_COLOR: Record<number, string> = {
   [FIREWALL]: "#f59e0b",
   [HONEYPOT]: "#a78bfa",
   [CORRUPTED]: "#22d3ee",
+  [SLOW]: "#14b8a6",
 };
 
 // Difficulty presets. NODE_COUNT stays 16 (the model's input is fixed at that
@@ -145,6 +149,18 @@ function roundScore(
   return Math.round((300 + speed + efficiency + method) * DIFF_MULT[diff]);
 }
 
+// Agent-vs-defense resolution odds. These MUST mirror training/env.py so the live
+// agent behaves the way it was trained. If you retune one side, retune both.
+const FIREWALL_BREACH = 0.35; // P(agent forces through a firewall on an attempt)
+const HONEYPOT_TRAP = 0.7; // P(a honeypot actually catches the agent when entered)
+const SLOW_PASS = 0.6; // P(agent crosses a tarpit on an attempt; else it stalls a tick)
+const DETECTION_PER_STEP = 0.014; // base "noise" the agent accrues each move
+const DETECTION_ON_FAIL = 0.05; // extra noise when a firewall breach attempt fails
+// Monitors are a frontend-only accelerant (the env trains against base noise only):
+// being on or beside a monitored node raises the detection rate so the defender can
+// catch the agent before it breaches.
+const MONITOR_RATE = 0.07;
+
 // Layout mapping (normalized 0..1 -> SVG viewBox).
 const VIEW_W = 1000;
 const VIEW_H = 760;
@@ -219,6 +235,13 @@ export default function NetworkSimulator() {
   const [sessionPoints, setSessionPoints] = useState(0);
   const [flash, setFlash] = useState<null | "breach" | "contain">(null);
   const [showTutorial, setShowTutorial] = useState(false);
+  // Multi-objective + detection (Phases 3–4).
+  const [detection, setDetection] = useState(0); // 0..1 noise meter
+  const detectionRef = useRef(0);
+  const [reachedFoothold, setReachedFoothold] = useState(false);
+  const reachedFootholdRef = useRef(false);
+  const [monitors, setMonitors] = useState<Set<number>>(new Set());
+  const monitorsRef = useRef<Set<number>>(new Set());
   const audioCtx = useRef<AudioContext | null>(null);
   const tickRef = useRef<() => void>(() => {});
 
@@ -378,6 +401,28 @@ export default function NetworkSimulator() {
     [pushLog],
   );
 
+  // Reset the per-round dynamic state (detection meter + foothold progress, and
+  // optionally the placed monitors when the board itself changes).
+  const resetDynamics = useCallback((clearMonitors: boolean) => {
+    detectionRef.current = 0;
+    setDetection(0);
+    reachedFootholdRef.current = false;
+    setReachedFoothold(false);
+    if (clearMonitors) {
+      monitorsRef.current = new Set();
+      setMonitors(new Set());
+    }
+  }, []);
+
+  // Extra detection accrued per step from monitors on or beside the agent.
+  const monitorBoost = useCallback((node: number): number => {
+    const mon = monitorsRef.current;
+    if (mon.size === 0) return 0;
+    if (mon.has(node)) return MONITOR_RATE;
+    for (const v of neighbors(netRef.current.adjacency, node)) if (mon.has(v)) return MONITOR_RATE * 0.5;
+    return 0;
+  }, []);
+
   // Escalating waves: regenerate a harder board (faster agent + denser links) and
   // auto-relaunch. Uses tickRef so it doesn't have to depend on the game loop.
   const advanceWave = useCallback(
@@ -403,6 +448,7 @@ export default function NetworkSimulator() {
       setTickMs(Math.max(200, base.tickMs - (nextWave - 1) * 60));
       setSeverPick(null);
       setHeat([]);
+      resetDynamics(true);
       workerRef.current?.postMessage({ type: "reset" });
       // Stay IDLE so the defender can fortify the new board, then launch the wave.
       setStatus("idle");
@@ -410,7 +456,7 @@ export default function NetworkSimulator() {
       sfx("wave");
       pushLog(`▲ WAVE ${nextWave} ready — denser network, faster agent. Deploy defenses, then launch.`);
     },
-    [sfx, pushLog],
+    [sfx, pushLog, resetDynamics],
   );
 
   // Centralized round-end: streak + session points + waves + sound + screen flash.
@@ -509,8 +555,11 @@ export default function NetworkSimulator() {
   }, [status, cfg.creditCap, cfg.regenMs]);
 
   // -------------------------------------------------------------- policies
+  // Every adjacent node is a legal move now — firewalls are attackable rather than
+  // impassable, so the agent can choose to attempt a breach (resolved in applyMove).
+  // This mirrors env.py's action_masks(), which also exposes all neighbors.
   const legalMoves = useCallback((n: NetworkState, pos: number): number[] => {
-    return neighbors(n.adjacency, pos).filter((v) => n.nodeStates[v] !== FIREWALL);
+    return neighbors(n.adjacency, pos);
   }, []);
 
   // Greedy fallback used until the .onnx policy is available. Also produces an
@@ -518,9 +567,10 @@ export default function NetworkSimulator() {
   // even before a trained model is loaded.
   const heuristicMove = useCallback(
     (n: NetworkState, pos: number, moves: number[]): { action: number; dist: number[] } => {
+      const goal = reachedFootholdRef.current ? n.target : n.foothold;
       let best = moves[0];
       let bestD = Infinity;
-      const dists = moves.map((m) => bfsDistance(n.adjacency, n.nodeStates, m, n.target));
+      const dists = moves.map((m) => bfsDistance(n.adjacency, n.nodeStates, m, goal));
       moves.forEach((m, i) => {
         if (dists[i] < bestD) {
           bestD = dists[i];
@@ -549,7 +599,7 @@ export default function NetworkSimulator() {
         workerRef.current?.postMessage({
           type: "infer",
           requestId: id,
-          obs: buildObservation(n, pos),
+          obs: buildObservation(n, pos, reachedFootholdRef.current ? n.target : n.foothold),
           validActions: moves,
         });
       });
@@ -562,11 +612,40 @@ export default function NetworkSimulator() {
     (action: number) => {
       const n = netRef.current;
       const state = n.nodeStates[action];
+
+      // Penetrable firewall: an attempt forces through only sometimes; a failed
+      // attempt rebuffs the agent (it stays put, turn still spent) and is noisy.
+      if (state === FIREWALL) {
+        if (Math.random() >= FIREWALL_BREACH) {
+          detectionRef.current = Math.min(1, detectionRef.current + DETECTION_ON_FAIL);
+          setHeat([]);
+          pushLog(`!! firewall held at node ${action} — breach failed (detection +).`);
+          return;
+        }
+        pushLog(`>> agent forced the firewall at node ${action}.`);
+      } else if (state === SLOW) {
+        // Tarpit: sometimes the agent bogs down and loses the tick.
+        if (Math.random() >= SLOW_PASS) {
+          setHeat([]);
+          pushLog(`~~ agent bogged down in the tarpit at node ${action}.`);
+          return;
+        }
+      }
+
       posRef.current = action;
       setAgentPos(action);
       setTrail((t) => (t[t.length - 1] === action ? t : [...t, action]));
 
-      if (action === n.target) {
+      // Multi-stage objective: secure the foothold first, then go for the database.
+      if (!reachedFootholdRef.current && action === n.foothold) {
+        reachedFootholdRef.current = true;
+        setReachedFoothold(true);
+        setHeat([]);
+        pushLog(`** foothold seized at node ${action} — agent now advancing on the database.`);
+        return;
+      }
+
+      if (reachedFootholdRef.current && action === n.target) {
         statusRef.current = "breach";
         setStatus("breach");
         setScore((s) => ({ ...s, breaches: s.breaches + 1 }));
@@ -574,12 +653,17 @@ export default function NetworkSimulator() {
         pushLog(`>> BREACH — database node ${action} compromised.`);
         concludeRound(false, "breach");
       } else if (state === HONEYPOT) {
-        statusRef.current = "trapped";
-        setStatus("trapped");
-        setScore((s) => ({ ...s, contained: s.contained + 1 }));
-        setHeat([]);
-        pushLog(`<< TRAPPED — agent ensnared in honeypot at node ${action}.`);
-        concludeRound(true, "honeypot");
+        // Leaky honeypot: only sometimes catches the agent; otherwise it slips by.
+        if (Math.random() < HONEYPOT_TRAP) {
+          statusRef.current = "trapped";
+          setStatus("trapped");
+          setScore((s) => ({ ...s, contained: s.contained + 1 }));
+          setHeat([]);
+          pushLog(`<< TRAPPED — agent ensnared in honeypot at node ${action}.`);
+          concludeRound(true, "honeypot");
+        } else {
+          pushLog(`.. agent slipped past the honeypot at node ${action}.`);
+        }
       } else if (state === CORRUPTED) {
         corruptNext.current = true;
         pushLog(`~~ agent corrupted at node ${action} — next move scrambled.`);
@@ -620,12 +704,6 @@ export default function NetworkSimulator() {
       setHeat([]);
       const all = neighbors(n.adjacency, pos);
       action = all[Math.floor(Math.random() * all.length)];
-      if (n.nodeStates[action] === FIREWALL) {
-        pushLog("~~ scrambled move slammed into a firewall.");
-        setTurns((t) => t + 1);
-        if (statusRef.current === "running") setTimeout(tick, tickMs);
-        return;
-      }
     } else if (modelReady.current) {
       const res = await inferViaWorker(n, pos, moves);
       action = res.action;
@@ -644,8 +722,26 @@ export default function NetworkSimulator() {
 
     applyMove(action);
     setTurns((t) => t + 1);
+
+    // Detection rises each move (more near monitors); if it caps, the intrusion is
+    // traced and evicted — a containment win for the defender. Only meaningful once
+    // the agent is still live after this move.
+    if (statusRef.current === "running") {
+      detectionRef.current = Math.min(1, detectionRef.current + DETECTION_PER_STEP + monitorBoost(posRef.current));
+      setDetection(detectionRef.current);
+      if (detectionRef.current >= 1) {
+        statusRef.current = "detected";
+        setStatus("detected");
+        setScore((s) => ({ ...s, contained: s.contained + 1 }));
+        setHeat([]);
+        pushLog(">> DETECTED — intrusion traced and the agent evicted.");
+        concludeRound(true, "detected");
+        return;
+      }
+    }
+
     if (statusRef.current === "running") setTimeout(tick, tickMs);
-  }, [applyMove, heuristicMove, inferViaWorker, legalMoves, pushLog, tickMs, concludeRound]);
+  }, [applyMove, heuristicMove, inferViaWorker, legalMoves, pushLog, tickMs, concludeRound, monitorBoost]);
 
   // Keep a live ref to tick so wave auto-relaunch can call the latest version.
   useEffect(() => void (tickRef.current = tick), [tick]);
@@ -655,6 +751,7 @@ export default function NetworkSimulator() {
     if (status !== "idle") resetRound(false);
     setHeat([]);
     sfx("place"); // also unlocks the AudioContext on this user gesture
+    resetDynamics(false);
     workerRef.current?.postMessage({ type: "reset" });
     setStatus("running");
     statusRef.current = "running";
@@ -692,6 +789,7 @@ export default function NetworkSimulator() {
     setTrail([net.start]);
     setCredits(cfg.startCredits);
     setSeverPick(null);
+    resetDynamics(true);
     if (newLog) pushLog("// round reset — defenses cleared, links restored, agent back at entry.");
   };
 
@@ -714,6 +812,7 @@ export default function NetworkSimulator() {
     setTrail([fresh.start]);
     setCredits(cfg.startCredits);
     setSeverPick(null);
+    resetDynamics(true);
     pushLog("// new topology generated — domain randomized.");
   };
 
@@ -743,6 +842,7 @@ export default function NetworkSimulator() {
     setTrail([fresh.start]);
     setCredits(c.startCredits);
     setSeverPick(null);
+    resetDynamics(true);
     pushLog(`// difficulty set to ${c.label.toUpperCase()} — new network generated.`);
   };
 
@@ -793,12 +893,14 @@ export default function NetworkSimulator() {
     [TOOLS.FIREWALL]: FIREWALL,
     [TOOLS.HONEYPOT]: HONEYPOT,
     [TOOLS.CORRUPT]: CORRUPTED,
+    [TOOLS.TARPIT]: SLOW,
   };
   // Cost to refund when an existing defense is removed/replaced (mirrors TOOL_DEFS costs).
   const COST_BY_STATE: Record<number, number> = {
     [FIREWALL]: 2,
     [HONEYPOT]: 3,
     [CORRUPTED]: 2,
+    [SLOW]: 1,
   };
 
   const setNodeState = (id: number, state: NodeState) => {
@@ -824,11 +926,39 @@ export default function NetworkSimulator() {
   };
 
   const deployOnNode = (id: number) => {
-    if (id === posRef.current || id === net.target || id === net.start) {
+    if (id === posRef.current || id === net.target || id === net.start || id === net.foothold) {
       pushLog("xx cannot place a defense on that node.");
       return;
     }
     if (tool === TOOLS.SEVER) return; // sever works on edges/pairs, handled separately
+
+    // Monitor: a placed sensor (not a node-state the agent observes) that raises
+    // detection while the agent is on or beside it. Toggles on repeat click.
+    if (tool === TOOLS.MONITOR) {
+      const mon = monitorsRef.current;
+      if (mon.has(id)) {
+        const next = new Set(mon);
+        next.delete(id);
+        monitorsRef.current = next;
+        setMonitors(next);
+        setCredits((c) => Math.min(CREDIT_CAP, c + currentToolDef.cost));
+        sfx("remove");
+        pushLog(`-- monitor removed from node ${id} (+${currentToolDef.cost}cr).`);
+        return;
+      }
+      if (currentToolDef.cost > credits) {
+        pushLog("xx insufficient credits.");
+        return;
+      }
+      const next = new Set(mon);
+      next.add(id);
+      monitorsRef.current = next;
+      setMonitors(next);
+      setCredits((c) => Math.min(CREDIT_CAP, c - currentToolDef.cost));
+      sfx("place");
+      pushLog(`++ monitor deployed on node ${id}.`);
+      return;
+    }
 
     const targetState = DEFENSE_STATE[tool]!;
     const current = netRef.current.nodeStates[id];
@@ -1019,6 +1149,7 @@ export default function NetworkSimulator() {
     breach: { text: "DATABASE BREACHED", color: "#f43f5e" },
     trapped: { text: "AGENT CONTAINED", color: "#34d399" },
     stalled: { text: "NETWORK HELD", color: "#34d399" },
+    detected: { text: "AGENT DETECTED", color: "#38bdf8" },
   };
 
   return (
@@ -1080,9 +1211,28 @@ export default function NetworkSimulator() {
               ● {statusMeta[status].text}
             </span>
             <span className="text-slate-500">
-              turn {turns}/{cfg.maxTurns}
+              <span className={reachedFoothold ? "text-viper" : "text-amber"}>
+                {reachedFoothold ? "→ DATABASE" : "→ FOOTHOLD"}
+              </span>{" "}
+              · turn {turns}/{cfg.maxTurns}
             </span>
           </div>
+
+          {(status === "running" || detection > 0) && (
+            <div className="flex items-center gap-2 border-b border-edge px-4 py-1 text-[10px]">
+              <span className="tracking-widest text-sky-400">DETECTION</span>
+              <div className="h-1.5 flex-1 overflow-hidden rounded bg-edge">
+                <div
+                  className="h-full transition-all"
+                  style={{
+                    width: `${Math.round(detection * 100)}%`,
+                    background: detection > 0.66 ? "#f43f5e" : detection > 0.33 ? "#f59e0b" : "#38bdf8",
+                  }}
+                />
+              </div>
+              <span className="text-slate-500">{Math.round(detection * 100)}%</span>
+            </div>
+          )}
 
           <svg
             ref={svgRef}
@@ -1153,6 +1303,8 @@ export default function NetworkSimulator() {
               const isTarget = p.id === net.target;
               const isAgent = p.id === agentPos;
               const isStart = p.id === net.start;
+              const isFoothold = p.id === net.foothold;
+              const isMonitored = monitors.has(p.id);
               const st = net.nodeStates[p.id];
               const fill = isTarget ? "#0b3d2e" : STATE_COLOR[st];
               const stroke = isTarget
@@ -1180,6 +1332,19 @@ export default function NetworkSimulator() {
                   {isTarget && (
                     <circle r={NODE_R + 6} fill="none" stroke="#34d399" strokeWidth={1.5} className="pulse-ring" />
                   )}
+                  {isFoothold && !isTarget && (
+                    <circle
+                      r={NODE_R + 5}
+                      fill="none"
+                      stroke="#fbbf24"
+                      strokeWidth={1.5}
+                      strokeDasharray="3 3"
+                      strokeOpacity={reachedFoothold ? 0.25 : 0.9}
+                    />
+                  )}
+                  {isMonitored && (
+                    <circle r={NODE_R + 8} fill="none" stroke="#38bdf8" strokeWidth={1.5} strokeDasharray="2 3" strokeOpacity={0.8} />
+                  )}
                   <circle
                     r={picked ? NODE_R + 3 : NODE_R}
                     fill={fill}
@@ -1203,6 +1368,17 @@ export default function NetworkSimulator() {
                   {isTarget && (
                     <text textAnchor="middle" dy={-(NODE_R + 10)} fontSize="9" fill="#34d399">
                       DATABASE
+                    </text>
+                  )}
+                  {isFoothold && !isTarget && (
+                    <text
+                      textAnchor="middle"
+                      dy={-(NODE_R + 10)}
+                      fontSize="9"
+                      fill="#fbbf24"
+                      opacity={reachedFoothold ? 0.4 : 1}
+                    >
+                      {reachedFoothold ? "FOOTHOLD ✓" : "FOOTHOLD"}
                     </text>
                   )}
                 </g>
