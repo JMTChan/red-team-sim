@@ -181,6 +181,7 @@ export default function NetworkSimulator() {
   // Ingredients of the best-scoring round, so we submit those (not a raw number).
   const bestRecordRef = useRef<ScoreSubmission | null>(null);
   const [board, setBoard] = useState<ScoreEntry[]>([]);
+  const [boardDiff, setBoardDiff] = useState<Difficulty>(DEFAULT_DIFFICULTY);
   const [playerName, setPlayerName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submittedBest, setSubmittedBest] = useState(0);
@@ -402,12 +403,14 @@ export default function NetworkSimulator() {
       setTickMs(Math.max(200, base.tickMs - (nextWave - 1) * 60));
       setSeverPick(null);
       setHeat([]);
-      setStatus("running");
-      statusRef.current = "running";
+      workerRef.current?.postMessage({ type: "reset" });
+      // Stay IDLE so the defender can fortify the new board, then launch the wave.
+      setStatus("idle");
+      statusRef.current = "idle";
       sfx("wave");
-      setTimeout(() => tickRef.current(), 600);
+      pushLog(`▲ WAVE ${nextWave} ready — denser network, faster agent. Deploy defenses, then launch.`);
     },
-    [sfx],
+    [sfx, pushLog],
   );
 
   // Centralized round-end: streak + session points + waves + sound + screen flash.
@@ -454,12 +457,12 @@ export default function NetworkSimulator() {
             }
             return nb;
           });
-          pushLog(`▲ WAVE ${next} — the adversary adapts.`);
           advanceWave(next);
         } else {
           pushLog(`✖ wave run ended at wave ${waveRef.current}.`);
           waveRef.current = 1;
           setWave(1);
+          setTickMs(cfgRef.current.tickMs); // back to base speed for the next run
         }
       }
     },
@@ -652,16 +655,14 @@ export default function NetworkSimulator() {
     if (status !== "idle") resetRound(false);
     setHeat([]);
     sfx("place"); // also unlocks the AudioContext on this user gesture
-    if (wavesRef.current) {
-      waveRef.current = 1;
-      setWave(1);
-      streakRef.current = 0;
-      setStreak(0);
-      setTickMs(cfgRef.current.tickMs);
-    }
+    workerRef.current?.postMessage({ type: "reset" });
     setStatus("running");
     statusRef.current = "running";
-    pushLog(wavesRef.current ? "// WAVE 1 — defend the database." : "// intrusion initiated. defend the database.");
+    pushLog(
+      wavesRef.current
+        ? `// wave ${waveRef.current} — intrusion live. defend the database.`
+        : "// intrusion initiated. defend the database.",
+    );
     setTimeout(tick, 300);
   };
 
@@ -721,6 +722,7 @@ export default function NetworkSimulator() {
     if (d === difficulty) return;
     const c = DIFFICULTY[d];
     setDifficulty(d);
+    setBoardDiff(d);
     cfgRef.current = c;
     setTickMs(c.tickMs);
     const fresh = generateNetwork(Date.now(), c.extraEdgeProb);
@@ -1341,7 +1343,7 @@ export default function NetworkSimulator() {
                   onClick={start}
                   className="col-span-2 rounded border border-blood bg-blood/10 py-2 text-xs font-semibold text-blood hover:bg-blood/20"
                 >
-                  ▶ LAUNCH INTRUSION
+                  ▶ {wavesMode ? `LAUNCH WAVE ${wave}` : "LAUNCH INTRUSION"}
                 </button>
               )}
               <button
@@ -1378,6 +1380,7 @@ export default function NetworkSimulator() {
                 setWave(1);
                 streakRef.current = 0;
                 setStreak(0);
+                setTickMs(cfgRef.current.tickMs);
                 if (status === "running") {
                   setStatus("idle");
                   statusRef.current = "idle";
@@ -1452,6 +1455,21 @@ export default function NetworkSimulator() {
             <h2 className="mb-2 font-display text-xs tracking-widest text-slate-400">LEADERBOARD</h2>
             {leaderboardEnabled() ? (
               <>
+                <div className="mb-2 grid grid-cols-3 gap-1">
+                  {(Object.keys(DIFFICULTY) as Difficulty[]).map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => setBoardDiff(d)}
+                      className={`rounded border px-1 py-1 text-[10px] font-semibold transition ${
+                        boardDiff === d
+                          ? "border-cyan bg-cyan/10 text-cyan"
+                          : "border-edge text-slate-400 hover:border-slate-600"
+                      }`}
+                    >
+                      {DIFFICULTY[d].label}
+                    </button>
+                  ))}
+                </div>
                 <div className="mb-2 flex gap-2">
                   <input
                     value={playerName}
@@ -1475,17 +1493,21 @@ export default function NetworkSimulator() {
                 </div>
                 {turnstileOn() && <div ref={turnstileDivRef} className="mb-2" />}
                 <ol className="log-scroll max-h-44 space-y-1 overflow-y-auto text-[11px]">
-                  {board.length === 0 && <li className="text-slate-600">No scores yet — be the first.</li>}
-                  {board.slice(0, 15).map((e, i) => (
-                    <li key={i} className="flex items-center justify-between gap-2">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span className="w-4 shrink-0 text-right text-slate-600">{i + 1}</span>
-                        <span className="truncate text-slate-300">{e.name}</span>
-                        <span className="shrink-0 text-[9px] uppercase text-slate-600">{e.difficulty}</span>
-                      </span>
-                      <span className="shrink-0 font-bold text-amber">{e.score}</span>
-                    </li>
-                  ))}
+                  {board.filter((e) => e.difficulty === boardDiff).length === 0 && (
+                    <li className="text-slate-600">No {DIFFICULTY[boardDiff].label} scores yet — be the first.</li>
+                  )}
+                  {board
+                    .filter((e) => e.difficulty === boardDiff)
+                    .slice(0, 15)
+                    .map((e, i) => (
+                      <li key={i} className="flex items-center justify-between gap-2">
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="w-4 shrink-0 text-right text-slate-600">{i + 1}</span>
+                          <span className="truncate text-slate-300">{e.name}</span>
+                        </span>
+                        <span className="shrink-0 font-bold text-amber">{e.score}</span>
+                      </li>
+                    ))}
                 </ol>
               </>
             ) : (
