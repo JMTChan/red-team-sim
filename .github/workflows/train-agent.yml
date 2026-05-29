@@ -45,7 +45,7 @@ jobs:
 
       - name: Train (resume from latest_model.zip if present)
         env:
-          TRAIN_MAX_SECONDS: "19800"   # 5.5 hours
+          TRAIN_MAX_SECONDS: "4680"   # 5.5 hours
         run: python training/train.py
 
       - name: Commit & push updated model
