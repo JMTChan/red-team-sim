@@ -45,17 +45,42 @@ jobs:
 
       - name: Train (resume from latest_model.zip if present)
         env:
-          TRAIN_MAX_SECONDS: "3600"   # 5.5 hours
+          TRAIN_MAX_SECONDS: "5400"   # 1.5 hours
         run: python training/train.py
 
       - name: Commit & push updated model
+        if: always()   # push the last checkpoint even if training errored or was cut short
         run: |
+          if [ ! -f training/latest_model.zip ] && [ ! -f public/red_team_agent.onnx ]; then
+            echo "No model artifacts produced; nothing to push."
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add training/latest_model.zip public/red_team_agent.onnx
-          if git diff --staged --quiet; then
-            echo "No model changes to commit."
-          else
+          # Preserve the freshly trained artifacts, then re-anchor onto the latest
+          # main before committing — main may have advanced during the long run
+          # (e.g. you pushed a file change), which would otherwise reject the push
+          # as a non-fast-forward and waste the whole run. Retry to survive a race.
+          mkdir -p /tmp/model_out
+          cp -f training/latest_model.zip   /tmp/model_out/ 2>/dev/null || true
+          cp -f public/red_team_agent.onnx  /tmp/model_out/ 2>/dev/null || true
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp -f /tmp/model_out/latest_model.zip   training/latest_model.zip  2>/dev/null || true
+            cp -f /tmp/model_out/red_team_agent.onnx public/red_team_agent.onnx 2>/dev/null || true
+            git add training/latest_model.zip public/red_team_agent.onnx
+            if git diff --staged --quiet; then
+              echo "No model changes to commit."
+              exit 0
+            fi
             git commit -m "chore: auto-trained model $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
-          fi
+            if git push origin HEAD:main; then
+              echo "Pushed trained model."
+              exit 0
+            fi
+            echo "push attempt $i failed (main likely moved); re-anchoring and retrying..."
+            sleep $((i * 3))
+          done
+          echo "ERROR: could not push trained model after retries" >&2
+          exit 1
