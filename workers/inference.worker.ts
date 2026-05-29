@@ -19,6 +19,10 @@ import { NODE_COUNT } from "../lib/constants";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 
 let session: ort.InferenceSession | null = null;
+// Node the agent occupied on the previous inference, so we can discourage it from
+// immediately bouncing straight back (the classic A->B->A->B loop a memoryless,
+// deterministic policy falls into once its productive paths are walled off).
+let lastPos = -1;
 
 interface Obs {
   node_states: Float32Array;
@@ -27,18 +31,35 @@ interface Obs {
   current_position: Float32Array;
 }
 
-async function init(modelUrl: string) {
-  const resp = await fetch(modelUrl);
-  if (!resp.ok) throw new Error(`Failed to fetch model (${resp.status}) at ${modelUrl}`);
-  const bytes = new Uint8Array(await resp.arrayBuffer());
-  session = await ort.InferenceSession.create(bytes, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all",
+function init(modelUrl: string): Promise<void> {
+  return fetch(modelUrl).then(async (resp) => {
+    if (!resp.ok) throw new Error(`Failed to fetch model (${resp.status}) at ${modelUrl}`);
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    session = await ort.InferenceSession.create(bytes, {
+      executionProviders: ["wasm"],
+      graphOptimizationLevel: "all",
+    });
   });
 }
 
-function argmaxMasked(logits: Float32Array, validActions: number[]): { action: number; dist: number[] } {
-  // Restrict the agent to legal moves; if none are legal it stays put.
+function indexOfOne(arr: Float32Array): number {
+  let idx = -1;
+  let best = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] > best) {
+      best = arr[i];
+      idx = i;
+    }
+  }
+  return idx;
+}
+
+function chooseAction(
+  logits: Float32Array,
+  validActions: number[],
+  avoid: number,
+): { action: number; dist: number[] } {
+  // Greedy legal move.
   let best = -1;
   let bestVal = -Infinity;
   for (const a of validActions) {
@@ -47,7 +68,8 @@ function argmaxMasked(logits: Float32Array, validActions: number[]): { action: n
       best = a;
     }
   }
-  // Softmax over the legal logits -> a "where does it want to go" distribution.
+  // Softmax over the legal logits -> a "where does it want to go" distribution
+  // (kept as the true policy intent, so the heatmap reflects what it learned).
   const dist = new Array(NODE_COUNT).fill(0);
   let sum = 0;
   for (const a of validActions) {
@@ -56,7 +78,24 @@ function argmaxMasked(logits: Float32Array, validActions: number[]): { action: n
     sum += e;
   }
   if (sum > 0) for (const a of validActions) dist[a] /= sum;
-  return { action: best, dist };
+
+  // Anti-backtrack: if the greedy pick is to walk straight back where we came
+  // from, take the next-best legal move instead — unless backtracking is the
+  // ONLY option (a genuine dead end), in which case we allow it.
+  let action = best;
+  if (action === avoid && validActions.length > 1) {
+    let alt = -1;
+    let altVal = -Infinity;
+    for (const a of validActions) {
+      if (a === avoid) continue;
+      if (logits[a] > altVal) {
+        altVal = logits[a];
+        alt = a;
+      }
+    }
+    if (alt >= 0) action = alt;
+  }
+  return { action, dist };
 }
 
 async function infer(obs: Obs, validActions: number[]): Promise<{ action: number; dist: number[] }> {
@@ -69,7 +108,10 @@ async function infer(obs: Obs, validActions: number[]): Promise<{ action: number
   };
   const out = await session.run(feeds);
   const logits = out.logits.data as Float32Array;
-  return argmaxMasked(logits, validActions);
+  const currentPos = indexOfOne(obs.current_position);
+  const result = chooseAction(logits, validActions, lastPos);
+  lastPos = currentPos; // next move, "backtracking" means returning here
+  return result;
 }
 
 self.onmessage = async (e: MessageEvent) => {
@@ -78,6 +120,8 @@ self.onmessage = async (e: MessageEvent) => {
     if (msg.type === "init") {
       await init(msg.modelUrl);
       (self as DedicatedWorkerGlobalScope).postMessage({ type: "ready" });
+    } else if (msg.type === "reset") {
+      lastPos = -1; // new round / new board: forget the previous trajectory
     } else if (msg.type === "infer") {
       const { action, dist } = await infer(msg.obs as Obs, msg.validActions as number[]);
       (self as DedicatedWorkerGlobalScope).postMessage({
