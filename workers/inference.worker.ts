@@ -37,7 +37,7 @@ async function init(modelUrl: string) {
   });
 }
 
-function argmaxMasked(logits: Float32Array, validActions: number[]): number {
+function argmaxMasked(logits: Float32Array, validActions: number[]): { action: number; dist: number[] } {
   // Restrict the agent to legal moves; if none are legal it stays put.
   let best = -1;
   let bestVal = -Infinity;
@@ -47,10 +47,19 @@ function argmaxMasked(logits: Float32Array, validActions: number[]): number {
       best = a;
     }
   }
-  return best;
+  // Softmax over the legal logits -> a "where does it want to go" distribution.
+  const dist = new Array(NODE_COUNT).fill(0);
+  let sum = 0;
+  for (const a of validActions) {
+    const e = Math.exp(logits[a] - bestVal);
+    dist[a] = e;
+    sum += e;
+  }
+  if (sum > 0) for (const a of validActions) dist[a] /= sum;
+  return { action: best, dist };
 }
 
-async function infer(obs: Obs, validActions: number[]): Promise<number> {
+async function infer(obs: Obs, validActions: number[]): Promise<{ action: number; dist: number[] }> {
   if (!session) throw new Error("Session not initialized");
   const feeds: Record<string, ort.Tensor> = {
     node_states: new ort.Tensor("float32", obs.node_states, [1, NODE_COUNT]),
@@ -70,11 +79,12 @@ self.onmessage = async (e: MessageEvent) => {
       await init(msg.modelUrl);
       (self as DedicatedWorkerGlobalScope).postMessage({ type: "ready" });
     } else if (msg.type === "infer") {
-      const action = await infer(msg.obs as Obs, msg.validActions as number[]);
+      const { action, dist } = await infer(msg.obs as Obs, msg.validActions as number[]);
       (self as DedicatedWorkerGlobalScope).postMessage({
         type: "action",
         requestId: msg.requestId,
         action,
+        dist,
       });
     }
   } catch (err) {
