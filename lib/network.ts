@@ -1,4 +1,5 @@
 import { NODE_COUNT, OPEN, FIREWALL, type NodeState } from "./constants";
+import type { AssetRole } from "./education";
 
 export interface NodePos {
   id: number;
@@ -10,6 +11,7 @@ export interface NetworkState {
   adjacency: number[][]; // NxN, 1=connected 0=severed
   positions: NodePos[];
   nodeStates: NodeState[];
+  roles: AssetRole[]; // cosmetic asset type per node (does not affect the agent)
   start: number;
   foothold: number; // first objective the agent must reach (multi-stage attack)
   target: number;
@@ -155,7 +157,19 @@ export function generateNetwork(seed = Date.now(), extraEdgeProb = 0.18, ensureT
 
   const nodeStates: NodeState[] = Array(n).fill(OPEN) as NodeState[];
 
-  return { adjacency, positions, nodeStates, start, foothold, target };
+  // Cosmetic asset roles (purely for framing — the agent never sees these). The
+  // entry is a workstation (initial access), the foothold a domain controller, the
+  // target the database; everything else is a weighted mix of hosts.
+  const roles: AssetRole[] = Array(n).fill("workstation") as AssetRole[];
+  for (let i = 0; i < n; i++) {
+    const r = rand();
+    roles[i] = r < 0.5 ? "workstation" : r < 0.82 ? "webserver" : "appserver";
+  }
+  roles[start] = "workstation";
+  roles[foothold] = "domaincontroller";
+  roles[target] = "database";
+
+  return { adjacency, positions, nodeStates, roles, start, foothold, target };
 }
 
 /** Hop distance over passable nodes (firewalls block). Returns Infinity if unreachable. */
