@@ -50,6 +50,15 @@ HONEYPOT = 2
 CORRUPTED = 3
 SLOW = 4  # tarpit: passable but slow
 
+# Curriculum board-density range. The low end is an easy/sparse Recruit-style board;
+# the high end is denser than the hardest in-game tier, so a curriculum-trained agent
+# is competent across every difficulty the game will throw at it.
+EDGE_MIN = 0.10
+EDGE_MAX = 0.40
+# How wide a band of difficulty to sample below the current ceiling each episode
+# (keeps some variety / easier boards in the mix rather than all-hard).
+DIFF_WINDOW = 0.4
+
 
 def _one_hot(idx: int, n: int) -> np.ndarray:
     v = np.zeros(n, dtype=np.float32)
@@ -80,11 +89,16 @@ class RedTeamNetworkEnv(gym.Env):
         detection_per_step: float = 0.014,
         detection_on_fail: float = 0.05,  # extra noise on a failed firewall attempt
         foothold_bonus: float = 30.0,
+        # Curriculum difficulty ceiling in [0,1]. 0 = sparse boards + almost no
+        # defenses; 1 = dense boards + defenses concentrated on the agent's route by
+        # a "smart defender". A callback ramps this up as the agent improves. Defaults
+        # to 1.0 so a standalone env samples the full range (domain randomization).
+        difficulty: float = 1.0,
     ):
         super().__init__()
         self.n = int(n_nodes)
         self.max_steps = int(max_steps)
-        self.extra_edge_prob = float(extra_edge_prob)
+        self.extra_edge_prob = float(extra_edge_prob)  # legacy; curriculum drives density now
         self.firewall_prob = float(firewall_prob)
         self.honeypot_prob = float(honeypot_prob)
         self.corrupt_prob = float(corrupt_prob)
@@ -96,6 +110,8 @@ class RedTeamNetworkEnv(gym.Env):
         self.detection_per_step = float(detection_per_step)
         self.detection_on_fail = float(detection_on_fail)
         self.foothold_bonus = float(foothold_bonus)
+        self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self._episode_difficulty = 0.0
 
         n = self.n
         self.observation_space = spaces.Dict(
@@ -121,7 +137,7 @@ class RedTeamNetworkEnv(gym.Env):
         self._corrupt_next = False
 
     # ------------------------------------------------------------------ utils
-    def _random_connected_graph(self) -> np.ndarray:
+    def _random_connected_graph(self, edge_prob: float) -> np.ndarray:
         n = self.n
         adj = np.zeros((n, n), dtype=np.float32)
         nodes = self.np_random.permutation(n)
@@ -131,9 +147,44 @@ class RedTeamNetworkEnv(gym.Env):
             adj[a, b] = adj[b, a] = 1.0
         for a in range(n):
             for b in range(a + 1, n):
-                if adj[a, b] == 0.0 and self.np_random.random() < self.extra_edge_prob:
+                if adj[a, b] == 0.0 and self.np_random.random() < edge_prob:
                     adj[a, b] = adj[b, a] = 1.0
         return adj
+
+    def _shortest_path(self, src: int, dst: int) -> list[int]:
+        """BFS shortest path (list of node ids) over links. Used by the smart
+        defender to place defenses on the agent's likely route."""
+        if src == dst:
+            return [src]
+        n = self.n
+        prev = [-1] * n
+        visited = np.zeros(n, dtype=bool)
+        visited[src] = True
+        queue = [src]
+        qi = 0
+        while qi < len(queue):
+            u = queue[qi]
+            qi += 1
+            if u == dst:
+                break
+            for v in range(n):
+                if self.adj[u, v] == 1.0 and not visited[v]:
+                    visited[v] = True
+                    prev[v] = u
+                    queue.append(v)
+        if not visited[dst]:
+            return []
+        path = []
+        cur = dst
+        while cur != -1:
+            path.append(cur)
+            cur = prev[cur]
+        return path[::-1]
+
+    def set_difficulty(self, d: float) -> None:
+        """Set the curriculum difficulty ceiling (0..1). Called by the training
+        callback as the agent improves."""
+        self.difficulty = float(np.clip(d, 0.0, 1.0))
 
     def _bfs_distance(self, src: int, dst: int) -> int:
         """Pure hop distance over the graph. Firewalls/tarpits are penetrable now,
@@ -185,7 +236,21 @@ class RedTeamNetworkEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         n = self.n
-        self.adj = self._random_connected_graph()
+
+        # Per-episode difficulty: a moving window up to the current curriculum ceiling
+        # (keeps some easier boards in the mix instead of all-hard).
+        hi = self.difficulty
+        lo = max(0.0, hi - DIFF_WINDOW)
+        d = float(self.np_random.uniform(lo, hi)) if hi > 0 else 0.0
+        self._episode_difficulty = d
+
+        # Board density spans the full range EVERY episode, independent of the
+        # difficulty ramp, so the agent stays competent on sparse Recruit boards AND
+        # dense Elite boards (the in-game tiers). Denser boards actually have *more*
+        # routes (easier for the attacker), so density is generalization, not
+        # difficulty -- the curriculum ramps the *defense* below instead.
+        edge_prob = float(self.np_random.uniform(EDGE_MIN, EDGE_MAX))
+        self.adj = self._random_connected_graph(edge_prob)
 
         # Three distinct anchor nodes: start -> foothold -> database.
         picks = self.np_random.permutation(n)[:3]
@@ -194,28 +259,34 @@ class RedTeamNetworkEnv(gym.Env):
         self.final_target = int(picks[2])
         self.reached_foothold = False
         self.target = self.foothold  # first goal
-
         anchors = {self.current, self.foothold, self.final_target}
+
         self.node_states = np.zeros(n, dtype=np.float32)
+
+        # --- Smart defender: concentrate defenses on the agent's likely route,
+        # scaled by difficulty. This trains the agent against targeted, human-style
+        # defense (chokepoints on the path) rather than random scatter. Everything
+        # stays winnable: firewalls are penetrable and honeypots leaky.
+        route = self._shortest_path(self.current, self.foothold)[:-1] + self._shortest_path(
+            self.foothold, self.final_target
+        )
+        path_nodes = [v for v in dict.fromkeys(route) if v not in anchors]
+        self.np_random.shuffle(path_nodes)
+        n_smart = int(round(d * len(path_nodes)))
+        smart_types = [HONEYPOT, FIREWALL, SLOW, HONEYPOT, FIREWALL]  # weighted to traps/walls
+        for node in path_nodes[:n_smart]:
+            self.node_states[node] = smart_types[self.np_random.integers(0, len(smart_types))]
+
+        # --- Random sprinkle elsewhere for variety, also scaled by difficulty. At max
+        # difficulty this brings total defenses to ~8-10 (denser than the old fixed
+        # spawn), but now layered on top of the route-targeted placement above.
+        rnd_prob = 0.04 + 0.28 * d
+        spread = [FIREWALL, HONEYPOT, CORRUPTED, SLOW]
         for node in range(n):
-            if node in anchors:
+            if node in anchors or self.node_states[node] != OPEN:
                 continue
-            r = self.np_random.random()
-            t = self.firewall_prob
-            if r < t:
-                self.node_states[node] = FIREWALL
-                continue
-            t += self.honeypot_prob
-            if r < t:
-                self.node_states[node] = HONEYPOT
-                continue
-            t += self.corrupt_prob
-            if r < t:
-                self.node_states[node] = CORRUPTED
-                continue
-            t += self.slow_prob
-            if r < t:
-                self.node_states[node] = SLOW
+            if self.np_random.random() < rnd_prob:
+                self.node_states[node] = spread[self.np_random.integers(0, len(spread))]
 
         self.detection = 0.0
         self.steps = 0
