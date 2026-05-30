@@ -24,12 +24,14 @@ ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/di
 // policy will fall into limit cycles (A->B->A, or longer A->B->C->A circles) on
 // some boards; sampling breaks cycles of any length while still favoring the
 // target, because the distribution itself points that way.
-//   TEMPERATURE: 1.0 reproduces training behavior. Lower = sharper/more optimal
-//                (but too low reintroduces deterministic loops); higher = more
-//                exploratory/wandering.
+//   TEMPERATURE: 1.0 reproduces training behavior. Lower = sharper/more decisive
+//                play (the agent commits to its best move more often, so it pathfinds
+//                more directly and looks smarter); too low (~<0.4) reintroduces the
+//                deterministic loops; higher = more exploratory/wandering. 0.8 is a
+//                sharper-than-training default that stays well clear of the loop zone.
 //   BACKTRACK_PENALTY: extra soft discouragement against immediately reversing
 //                into the node we just came from (1 = none, 0 = forbidden).
-const TEMPERATURE = 1.0;
+const TEMPERATURE = 0.8;
 const BACKTRACK_PENALTY = 0.3;
 
 let session: ort.InferenceSession | null = null;
