@@ -673,13 +673,19 @@ export default function NetworkSimulator() {
         return;
       }
 
-      if (reachedFootholdRef.current && action === n.target) {
-        statusRef.current = "breach";
-        setStatus("breach");
-        setScore((s) => ({ ...s, breaches: s.breaches + 1 }));
-        setHeat([]);
-        pushLog(`>> BREACH — database node ${action} compromised.`);
-        concludeRound(false, "breach");
+      if (action === n.target) {
+        if (reachedFootholdRef.current) {
+          statusRef.current = "breach";
+          setStatus("breach");
+          setScore((s) => ({ ...s, breaches: s.breaches + 1 }));
+          setHeat([]);
+          pushLog(`>> BREACH — database node ${action} compromised.`);
+          concludeRound(false, "breach");
+        } else {
+          // Database is dormant until the foothold is secured — the agent just
+          // transits the node here, no access yet.
+          pushLog(`.. agent reached the database (node ${action}) but holds no foothold — no access yet.`);
+        }
       } else if (state === HONEYPOT) {
         // Leaky honeypot: only sometimes catches the agent; otherwise it slips by.
         if (Math.random() < HONEYPOT_TRAP) {
@@ -1344,9 +1350,14 @@ export default function NetworkSimulator() {
               const isFoothold = p.id === net.foothold;
               const isMonitored = monitors.has(p.id);
               const st = net.nodeStates[p.id];
-              const fill = isTarget ? "#0b3d2e" : STATE_COLOR[st];
+              // The database is "locked" (dim/grey) until the agent secures the foothold,
+              // then "armed" (green) — makes clear why an early pass-through doesn't win.
+              const dbLocked = isTarget && !reachedFoothold;
+              const fill = isTarget ? (reachedFoothold ? "#0b3d2e" : "#1c2b27") : STATE_COLOR[st];
               const stroke = isTarget
-                ? "#34d399"
+                ? reachedFoothold
+                  ? "#34d399"
+                  : "#475569"
                 : st === OPEN
                   ? "#2c5562"
                   : STATE_COLOR[st];
@@ -1367,8 +1378,18 @@ export default function NetworkSimulator() {
                       strokeWidth={1.5 + (heat[p.id] ?? 0) * 4}
                     />
                   )}
-                  {isTarget && (
+                  {isTarget && reachedFoothold && (
                     <circle r={NODE_R + 6} fill="none" stroke="#34d399" strokeWidth={1.5} className="pulse-ring" />
+                  )}
+                  {dbLocked && (
+                    <circle
+                      r={NODE_R + 6}
+                      fill="none"
+                      stroke="#475569"
+                      strokeWidth={1.5}
+                      strokeDasharray="3 4"
+                      strokeOpacity={0.7}
+                    />
                   )}
                   {isFoothold && !isTarget && (
                     <circle
@@ -1393,7 +1414,7 @@ export default function NetworkSimulator() {
                     textAnchor="middle"
                     dy="4"
                     fontSize={NODE_FONT}
-                    fill={isTarget ? "#a7f3d0" : "#7d93a5"}
+                    fill={isTarget && reachedFoothold ? "#a7f3d0" : "#7d93a5"}
                     fontFamily="var(--font-mono)"
                   >
                     {p.id}
@@ -1414,8 +1435,13 @@ export default function NetworkSimulator() {
                     </text>
                   )}
                   {isTarget && (
-                    <text textAnchor="middle" dy={-(NODE_R + 10)} fontSize="9" fill="#34d399">
-                      DATABASE
+                    <text
+                      textAnchor="middle"
+                      dy={-(NODE_R + 10)}
+                      fontSize="9"
+                      fill={reachedFoothold ? "#34d399" : "#64748b"}
+                    >
+                      {reachedFoothold ? "DATABASE" : "DATABASE · LOCKED"}
                     </text>
                   )}
                   {isFoothold && !isTarget && (
