@@ -43,6 +43,9 @@ N_ENVS = 8                        # parallel rollout environments
 MAX_SECONDS = float(os.environ.get("TRAIN_MAX_SECONDS", 5.5 * 3600))  # 5.5 hours
 CHECKPOINT_EVERY = 50_000         # timesteps between safety saves
 TOTAL_TIMESTEPS = 50_000_000      # an upper bound; the time callback stops us first
+# Curriculum: ramp the env difficulty ceiling from 0 -> 1 over this many steps, so the
+# agent learns on easy boards first and graduates to dense boards + a smart defender.
+CURRICULUM_RAMP_STEPS = 4_000_000
 
 # Larger network to handle the high-dimensional graph observation (node states +
 # the full N*N adjacency matrix). Masking matters more than raw size, but a roomy
@@ -89,6 +92,28 @@ class TimeAndCheckpointCallback(BaseCallback):
         if time.time() - self.start >= self.max_seconds:
             print(f"[time-limit] {self.max_seconds/3600:.2f}h reached -> stopping", flush=True)
             return False  # ends learn() gracefully
+        return True
+
+
+class CurriculumCallback(BaseCallback):
+    """Ramp the env difficulty ceiling from 0 -> 1 over `ramp_steps` timesteps and push
+    it to every (vectorized) env, so training starts on easy/sparse boards and graduates
+    to dense boards with a smart, route-targeting defender. The env samples a difficulty
+    window below this ceiling each episode, so it always sees some spread."""
+
+    def __init__(self, ramp_steps: int, update_every: int = 2048):
+        super().__init__()
+        self.ramp_steps = max(1, int(ramp_steps))
+        self.update_every = int(update_every)
+        self._last_d = -1.0
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.update_every == 0:
+            d = min(1.0, self.num_timesteps / self.ramp_steps)
+            # Only broadcast on a meaningful change to avoid needless env calls.
+            if abs(d - self._last_d) >= 0.01 or d >= 1.0:
+                self.training_env.env_method("set_difficulty", d)
+                self._last_d = d
         return True
 
 
@@ -178,8 +203,11 @@ def main():
     if model is None:
         model = build_fresh(venv)
 
-    callback = TimeAndCheckpointCallback(MAX_SECONDS, CHECKPOINT_EVERY, MODEL_ZIP)
-    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback, reset_num_timesteps=False)
+    callbacks = [
+        TimeAndCheckpointCallback(MAX_SECONDS, CHECKPOINT_EVERY, MODEL_ZIP),
+        CurriculumCallback(CURRICULUM_RAMP_STEPS),
+    ]
+    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks, reset_num_timesteps=False)
 
     model.save(MODEL_ZIP)
     print(f"[save] overwrote {MODEL_ZIP}", flush=True)
