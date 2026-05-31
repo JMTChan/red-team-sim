@@ -15,7 +15,7 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
 ![Stable--Baselines3](https://img.shields.io/badge/Stable--Baselines3-PPO-1f6feb)
 ![Static Export](https://img.shields.io/badge/100%25-Static-34d399)
-![License](https://img.shields.io/badge/License-MIT-fbbf24)
+![License](https://img.shields.io/badge/License-All_Rights_Reserved-64748b)
 
 ### [&#9654;&nbsp; Play it live](https://jmtchan.github.io/red-team-sim/)
 
@@ -142,6 +142,8 @@ python training/train.py     # writes training/latest_model.zip + public/red_tea
 
 ## License
 
-MIT &mdash; see [`LICENSE`](LICENSE).
+**All rights reserved.** This project is public so you can explore and play it, but it is
+**not** licensed for copying, reuse, or redistribution while it's under active development.
+This may change in the future.
 
 <div align="center"><sub>Built as a hands-on way to make security concepts something you can play, not just read.</sub></div>
