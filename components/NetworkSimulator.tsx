@@ -145,6 +145,10 @@ function loadTurnstileScript(): Promise<void> {
 // honeypot, and — heavily — playing on harder difficulty.
 const DIFF_MULT: Record<Difficulty, number> = { recruit: 1, operator: 2, elite: 4 };
 
+// Delay before the post-round incident report appears, so the breach / containment
+// outcome (flash, status banner, the agent reaching the node) renders first.
+const REPORT_DELAY_MS = 1100;
+
 function roundScore(
   result: string,
   turns: number,
@@ -203,14 +207,27 @@ export default function NetworkSimulator() {
 
   // Scoring + leaderboard.
   const [lastScore, setLastScore] = useState<number | null>(null);
-  const [bestScore, setBestScore] = useState(0);
-  // Ingredients of the best-scoring round, so we submit those (not a raw number).
-  const bestRecordRef = useRef<ScoreSubmission | null>(null);
+  const [bestScores, setBestScores] = useState<Record<Difficulty, number>>({
+    recruit: 0,
+    operator: 0,
+    elite: 0,
+  });
+  // Ingredients of the best-scoring round per difficulty, so we submit those (not a raw
+  // number) — and a Recruit best never shows or submits against Operator/Elite.
+  const bestRecordsRef = useRef<Record<Difficulty, ScoreSubmission | null>>({
+    recruit: null,
+    operator: null,
+    elite: null,
+  });
   const [board, setBoard] = useState<ScoreEntry[]>([]);
   const [boardDiff, setBoardDiff] = useState<Difficulty>(DEFAULT_DIFFICULTY);
   const [playerName, setPlayerName] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [submittedBest, setSubmittedBest] = useState(0);
+  const [submittedBests, setSubmittedBests] = useState<Record<Difficulty, number>>({
+    recruit: 0,
+    operator: 0,
+    elite: 0,
+  });
   const [turnstileToken, setTurnstileToken] = useState("");
   const turnstileDivRef = useRef<HTMLDivElement>(null);
   const turnstileWidgetId = useRef<string | null>(null);
@@ -255,6 +272,7 @@ export default function NetworkSimulator() {
   // Per-round tally for the incident report, plus the report + field-guide modals.
   const roundStatsRef = useRef({ fwHold: 0, fwBreach: 0, hpTrap: 0, hpEvade: 0, tarpit: 0, corrupt: 0 });
   const [report, setReport] = useState<RoundReport | null>(null);
+  const reportTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showGuide, setShowGuide] = useState(false);
   const audioCtx = useRef<AudioContext | null>(null);
   const tickRef = useRef<() => void>(() => {});
@@ -303,10 +321,15 @@ export default function NetworkSimulator() {
   // Restore local high score + name, and load the global board (if configured).
   useEffect(() => {
     try {
-      const b = Number(localStorage.getItem("rts-best") || 0);
-      if (b > 0) setBestScore(b);
-      const rec = localStorage.getItem("rts-best-record");
-      if (rec) bestRecordRef.current = JSON.parse(rec);
+      const diffs: Difficulty[] = ["recruit", "operator", "elite"];
+      const restoredScores: Record<Difficulty, number> = { recruit: 0, operator: 0, elite: 0 };
+      for (const d of diffs) {
+        const b = Number(localStorage.getItem(`rts-best-${d}`) || 0);
+        if (b > 0) restoredScores[d] = b;
+        const rec = localStorage.getItem(`rts-best-record-${d}`);
+        if (rec) bestRecordsRef.current[d] = JSON.parse(rec);
+      }
+      setBestScores(restoredScores);
       const n = localStorage.getItem("rts-name") || "";
       if (n) setPlayerName(n);
       setBestStreak(Number(localStorage.getItem("rts-best-streak") || 0));
@@ -390,8 +413,8 @@ export default function NetworkSimulator() {
       const s = roundScore(result, turns, creditsLeft, cfgRef.current.maxTurns, diff);
       setLastScore(s);
       if (s > 0) {
-        setBestScore((b) => {
-          if (s <= b) return b;
+        setBestScores((prev) => {
+          if (s <= prev[diff]) return prev;
           const record: ScoreSubmission = {
             name: "",
             result,
@@ -399,14 +422,14 @@ export default function NetworkSimulator() {
             creditsLeft,
             difficulty: diff,
           };
-          bestRecordRef.current = record;
+          bestRecordsRef.current = { ...bestRecordsRef.current, [diff]: record };
           try {
-            localStorage.setItem("rts-best", String(s));
-            localStorage.setItem("rts-best-record", JSON.stringify(record));
+            localStorage.setItem(`rts-best-${diff}`, String(s));
+            localStorage.setItem(`rts-best-record-${diff}`, JSON.stringify(record));
           } catch {
             /* ignore */
           }
-          return s;
+          return { ...prev, [diff]: s };
         });
         pushLog(`★ round score +${s}`);
       }
@@ -423,6 +446,12 @@ export default function NetworkSimulator() {
     reachedFootholdRef.current = false;
     setReachedFoothold(false);
     roundStatsRef.current = { fwHold: 0, fwBreach: 0, hpTrap: 0, hpEvade: 0, tarpit: 0, corrupt: 0 };
+    // Cancel any pending incident report and dismiss a showing one when the round resets.
+    if (reportTimerRef.current) {
+      clearTimeout(reportTimerRef.current);
+      reportTimerRef.current = null;
+    }
+    setReport(null);
     if (clearMonitors) {
       monitorsRef.current = new Set();
       setMonitors(new Set());
@@ -479,7 +508,9 @@ export default function NetworkSimulator() {
     (contained: boolean, result: string) => {
       const base = award(result);
       const st = roundStatsRef.current;
-      setReport({
+      // Capture the report now (before waves/advanceWave can reset the refs); it's shown
+      // after a short delay below so the breach/containment outcome renders first.
+      const reportData: RoundReport = {
         result,
         contained,
         turns: turnsRef.current,
@@ -487,7 +518,7 @@ export default function NetworkSimulator() {
         detection: Math.round(detectionRef.current * 100),
         reachedFoothold: reachedFootholdRef.current,
         ...st,
-      });
+      };
       if (contained) {
         sfx(result === "honeypot" ? "honeypot" : "contain");
         setFlash("contain");
@@ -536,6 +567,10 @@ export default function NetworkSimulator() {
           setTickMs(cfgRef.current.tickMs); // back to base speed for the next run
         }
       }
+
+      // Defer the incident report so the breach / containment outcome shows first.
+      if (reportTimerRef.current) clearTimeout(reportTimerRef.current);
+      reportTimerRef.current = setTimeout(() => setReport(reportData), REPORT_DELAY_MS);
     },
     [award, sfx, pushLog, advanceWave],
   );
@@ -885,8 +920,10 @@ export default function NetworkSimulator() {
 
   // ----------------------------------------------------------- leaderboard
   const submitBest = async () => {
-    const record = bestRecordRef.current;
-    if (!leaderboardEnabled() || !record || bestScore <= 0 || submitting) return;
+    // Submit the player's best for the board they're viewing (boardDiff).
+    const record = bestRecordsRef.current[boardDiff];
+    const best = bestScores[boardDiff];
+    if (!leaderboardEnabled() || !record || best <= 0 || submitting) return;
     if (turnstileOn() && !turnstileToken) {
       pushLog("xx complete the bot check before submitting.");
       return;
@@ -906,7 +943,7 @@ export default function NetworkSimulator() {
         turnstileToken: turnstileOn() ? turnstileToken : undefined,
       });
       setBoard(updated);
-      setSubmittedBest(bestScore);
+      setSubmittedBests((prev) => ({ ...prev, [boardDiff]: best }));
       pushLog(`☁ submitted best round as "${name}".`);
       // Turnstile tokens are single-use — get a fresh one for next time.
       const ts = (window as unknown as { turnstile?: any }).turnstile;
@@ -1686,7 +1723,7 @@ export default function NetworkSimulator() {
               </div>
               <div className="text-right">
                 <div className="text-[10px] tracking-widest text-slate-500">BEST</div>
-                <div className="text-xl font-bold text-amber">{bestScore}</div>
+                <div className="text-xl font-bold text-amber">{bestScores[difficulty]}</div>
               </div>
             </div>
             <div className="mt-2 flex items-center justify-between border-t border-edge pt-2 text-[10px] text-slate-500">
@@ -1732,13 +1769,17 @@ export default function NetworkSimulator() {
                     onClick={submitBest}
                     disabled={
                       submitting ||
-                      bestScore <= 0 ||
-                      bestScore === submittedBest ||
+                      bestScores[boardDiff] <= 0 ||
+                      bestScores[boardDiff] === submittedBests[boardDiff] ||
                       (turnstileOn() && !turnstileToken)
                     }
                     className="shrink-0 rounded border border-cyan bg-cyan/10 px-2 py-1 text-xs font-semibold text-cyan disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    {submitting ? "…" : bestScore === submittedBest && bestScore > 0 ? "Sent" : "Submit"}
+                    {submitting
+                      ? "…"
+                      : bestScores[boardDiff] === submittedBests[boardDiff] && bestScores[boardDiff] > 0
+                        ? "Sent"
+                        : "Submit"}
                   </button>
                 </div>
                 {turnstileOn() && <div ref={turnstileDivRef} className="mb-2" />}
